@@ -5,8 +5,121 @@ pub mod osm {
 use flatdata::{flatdata_read_bytes, flatdata_write_bytes};
 
 
+#[doc(hidden)]
+pub mod _builtin {
+#[allow(unused_imports)]
+use flatdata::{flatdata_read_bytes, flatdata_write_bytes};
+
+
+#[allow(missing_docs)]
+pub mod multivector {
+#[allow(unused_imports)]
+use flatdata::{flatdata_read_bytes, flatdata_write_bytes};
+
+
+/// Builtin type to for MultiVector index
+#[repr(transparent)]
+pub struct IndexType40 {
+    data: [u8; 5],
+}
+
+impl IndexType40 {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 5]}
+    }
+}
+
+impl flatdata::Struct for IndexType40 {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 5]}
+    }
+
+    const SIZE_IN_BYTES: usize = 5;
+    const IS_OVERLAPPING_WITH_NEXT : bool = true;
+}
+
+impl flatdata::Overlap for IndexType40 {}
+
+impl IndexType40 {
+    /// First element of the range [`range`].
+    ///
+    /// [`range`]: #method.range
+    #[inline]
+    pub fn value(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    #[inline]
+    pub fn range(&self) -> std::ops::Range<u64> {
+        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 0 + 5 * 8, 40);
+        start..end
+    }
+
+}
+
+impl std::fmt::Debug for IndexType40 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("IndexType40")
+            .field("value", &self.value())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for IndexType40 {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.value() == other.value()     }
+}
+
+impl IndexType40 {
+    /// First element of the range [`range`].
+    ///
+    /// [`range`]: struct.IndexType40Ref.html#method.range
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_value(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 0, 40)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &IndexType40) {
+        self.set_value(other.value());
+    }
+}
+
+impl flatdata::IndexStruct for IndexType40 {
+    #[inline]
+    fn range(&self) -> std::ops::Range<usize> {
+        let range = self.range();
+        range.start as usize..range.end as usize
+    }
+
+    #[inline]
+    fn set_index(&mut self, value: usize) {
+        self.set_value(value as u64);
+    }
+}
+
+
+#[doc(hidden)]
+pub mod schema {
+}
+}
+
+#[doc(hidden)]
+pub mod schema {
+}
+}
+
     /// Special value which represents an invalid index.
 pub const INVALID_IDX: u64 = 1_099_511_627_775;
+
+pub const Z_ORDER_RESOLUTION: u32 = 12;
 /// Metadata attached to the archive.
 #[repr(transparent)]
 #[derive(Clone)]
@@ -1469,6 +1582,763 @@ impl Id {
         self.set_value(other.value());
     }
 }
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct ZOrderIndexEntry {
+    data: [u8; 17],
+}
+
+impl ZOrderIndexEntry {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 17]}
+    }
+}
+
+impl flatdata::Struct for ZOrderIndexEntry {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 17]}
+    }
+
+    const SIZE_IN_BYTES: usize = 17;
+    const IS_OVERLAPPING_WITH_NEXT : bool = false;
+}
+
+impl ZOrderIndexEntry {
+    pub fn new( ) -> Self {
+        Self{data : [0; 17]}
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes(data: &[u8; 17]) -> &Self {
+        // Safety: This is safe since ZOrderIndexEntry is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes_mut(data: &mut [u8; 17]) -> &mut Self {
+        // Safety: This is safe since ZOrderIndexEntry is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice(data: &[u8]) -> Result<&Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 17 {
+            assert_eq!(data.len(), 17);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *const [u8; 17];
+        // Safety: We checked length before
+        Ok(Self::from_bytes(unsafe { &*ptr }))
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice_mut(data: &mut [u8]) -> Result<&mut Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 17 {
+            assert_eq!(data.len(), 17);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *mut [u8; 17];
+        // Safety: We checked length before
+        Ok(Self::from_bytes_mut(unsafe { &mut *ptr }))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 17] {
+        &self.data
+    }
+}
+
+impl Default for ZOrderIndexEntry {
+    fn default( ) -> Self {
+        Self::new( )
+    }
+}
+
+unsafe impl flatdata::NoOverlap for ZOrderIndexEntry {}
+
+impl ZOrderIndexEntry {
+    #[inline]
+    pub fn z_order(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 64);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    #[inline]
+    pub fn tag(&self) -> super::osm::GeoType {
+        let value = flatdata_read_bytes!(u8, self.data.as_ptr(), 64, 8);
+        unsafe { std::mem::transmute::<u8, super::osm::GeoType>(value) }
+    }
+
+    #[inline]
+    pub fn value(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 72, 64);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+}
+
+impl std::fmt::Debug for ZOrderIndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("ZOrderIndexEntry")
+            .field("z_order", &self.z_order())
+            .field("tag", &self.tag())
+            .field("value", &self.value())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for ZOrderIndexEntry {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.z_order() == other.z_order() &&        self.tag() == other.tag() &&        self.value() == other.value()     }
+}
+
+impl ZOrderIndexEntry {
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_z_order(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 0, 64)
+    }
+
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_tag(&mut self, value: super::osm::GeoType) {
+        flatdata_write_bytes!(u8; value, self.data, 64, 8)
+    }
+
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_value(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 72, 64)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &ZOrderIndexEntry) {
+        self.set_z_order(other.z_order());
+        self.set_tag(other.tag());
+        self.set_value(other.value());
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GeoType {
+    Node = 0,
+    Way = 1,
+    Relation = 2,
+    #[doc(hidden)]
+    UnknownValue3 = 3,
+    #[doc(hidden)]
+    UnknownValue4 = 4,
+    #[doc(hidden)]
+    UnknownValue5 = 5,
+    #[doc(hidden)]
+    UnknownValue6 = 6,
+    #[doc(hidden)]
+    UnknownValue7 = 7,
+    #[doc(hidden)]
+    UnknownValue8 = 8,
+    #[doc(hidden)]
+    UnknownValue9 = 9,
+    #[doc(hidden)]
+    UnknownValue10 = 10,
+    #[doc(hidden)]
+    UnknownValue11 = 11,
+    #[doc(hidden)]
+    UnknownValue12 = 12,
+    #[doc(hidden)]
+    UnknownValue13 = 13,
+    #[doc(hidden)]
+    UnknownValue14 = 14,
+    #[doc(hidden)]
+    UnknownValue15 = 15,
+    #[doc(hidden)]
+    UnknownValue16 = 16,
+    #[doc(hidden)]
+    UnknownValue17 = 17,
+    #[doc(hidden)]
+    UnknownValue18 = 18,
+    #[doc(hidden)]
+    UnknownValue19 = 19,
+    #[doc(hidden)]
+    UnknownValue20 = 20,
+    #[doc(hidden)]
+    UnknownValue21 = 21,
+    #[doc(hidden)]
+    UnknownValue22 = 22,
+    #[doc(hidden)]
+    UnknownValue23 = 23,
+    #[doc(hidden)]
+    UnknownValue24 = 24,
+    #[doc(hidden)]
+    UnknownValue25 = 25,
+    #[doc(hidden)]
+    UnknownValue26 = 26,
+    #[doc(hidden)]
+    UnknownValue27 = 27,
+    #[doc(hidden)]
+    UnknownValue28 = 28,
+    #[doc(hidden)]
+    UnknownValue29 = 29,
+    #[doc(hidden)]
+    UnknownValue30 = 30,
+    #[doc(hidden)]
+    UnknownValue31 = 31,
+    #[doc(hidden)]
+    UnknownValue32 = 32,
+    #[doc(hidden)]
+    UnknownValue33 = 33,
+    #[doc(hidden)]
+    UnknownValue34 = 34,
+    #[doc(hidden)]
+    UnknownValue35 = 35,
+    #[doc(hidden)]
+    UnknownValue36 = 36,
+    #[doc(hidden)]
+    UnknownValue37 = 37,
+    #[doc(hidden)]
+    UnknownValue38 = 38,
+    #[doc(hidden)]
+    UnknownValue39 = 39,
+    #[doc(hidden)]
+    UnknownValue40 = 40,
+    #[doc(hidden)]
+    UnknownValue41 = 41,
+    #[doc(hidden)]
+    UnknownValue42 = 42,
+    #[doc(hidden)]
+    UnknownValue43 = 43,
+    #[doc(hidden)]
+    UnknownValue44 = 44,
+    #[doc(hidden)]
+    UnknownValue45 = 45,
+    #[doc(hidden)]
+    UnknownValue46 = 46,
+    #[doc(hidden)]
+    UnknownValue47 = 47,
+    #[doc(hidden)]
+    UnknownValue48 = 48,
+    #[doc(hidden)]
+    UnknownValue49 = 49,
+    #[doc(hidden)]
+    UnknownValue50 = 50,
+    #[doc(hidden)]
+    UnknownValue51 = 51,
+    #[doc(hidden)]
+    UnknownValue52 = 52,
+    #[doc(hidden)]
+    UnknownValue53 = 53,
+    #[doc(hidden)]
+    UnknownValue54 = 54,
+    #[doc(hidden)]
+    UnknownValue55 = 55,
+    #[doc(hidden)]
+    UnknownValue56 = 56,
+    #[doc(hidden)]
+    UnknownValue57 = 57,
+    #[doc(hidden)]
+    UnknownValue58 = 58,
+    #[doc(hidden)]
+    UnknownValue59 = 59,
+    #[doc(hidden)]
+    UnknownValue60 = 60,
+    #[doc(hidden)]
+    UnknownValue61 = 61,
+    #[doc(hidden)]
+    UnknownValue62 = 62,
+    #[doc(hidden)]
+    UnknownValue63 = 63,
+    #[doc(hidden)]
+    UnknownValue64 = 64,
+    #[doc(hidden)]
+    UnknownValue65 = 65,
+    #[doc(hidden)]
+    UnknownValue66 = 66,
+    #[doc(hidden)]
+    UnknownValue67 = 67,
+    #[doc(hidden)]
+    UnknownValue68 = 68,
+    #[doc(hidden)]
+    UnknownValue69 = 69,
+    #[doc(hidden)]
+    UnknownValue70 = 70,
+    #[doc(hidden)]
+    UnknownValue71 = 71,
+    #[doc(hidden)]
+    UnknownValue72 = 72,
+    #[doc(hidden)]
+    UnknownValue73 = 73,
+    #[doc(hidden)]
+    UnknownValue74 = 74,
+    #[doc(hidden)]
+    UnknownValue75 = 75,
+    #[doc(hidden)]
+    UnknownValue76 = 76,
+    #[doc(hidden)]
+    UnknownValue77 = 77,
+    #[doc(hidden)]
+    UnknownValue78 = 78,
+    #[doc(hidden)]
+    UnknownValue79 = 79,
+    #[doc(hidden)]
+    UnknownValue80 = 80,
+    #[doc(hidden)]
+    UnknownValue81 = 81,
+    #[doc(hidden)]
+    UnknownValue82 = 82,
+    #[doc(hidden)]
+    UnknownValue83 = 83,
+    #[doc(hidden)]
+    UnknownValue84 = 84,
+    #[doc(hidden)]
+    UnknownValue85 = 85,
+    #[doc(hidden)]
+    UnknownValue86 = 86,
+    #[doc(hidden)]
+    UnknownValue87 = 87,
+    #[doc(hidden)]
+    UnknownValue88 = 88,
+    #[doc(hidden)]
+    UnknownValue89 = 89,
+    #[doc(hidden)]
+    UnknownValue90 = 90,
+    #[doc(hidden)]
+    UnknownValue91 = 91,
+    #[doc(hidden)]
+    UnknownValue92 = 92,
+    #[doc(hidden)]
+    UnknownValue93 = 93,
+    #[doc(hidden)]
+    UnknownValue94 = 94,
+    #[doc(hidden)]
+    UnknownValue95 = 95,
+    #[doc(hidden)]
+    UnknownValue96 = 96,
+    #[doc(hidden)]
+    UnknownValue97 = 97,
+    #[doc(hidden)]
+    UnknownValue98 = 98,
+    #[doc(hidden)]
+    UnknownValue99 = 99,
+    #[doc(hidden)]
+    UnknownValue100 = 100,
+    #[doc(hidden)]
+    UnknownValue101 = 101,
+    #[doc(hidden)]
+    UnknownValue102 = 102,
+    #[doc(hidden)]
+    UnknownValue103 = 103,
+    #[doc(hidden)]
+    UnknownValue104 = 104,
+    #[doc(hidden)]
+    UnknownValue105 = 105,
+    #[doc(hidden)]
+    UnknownValue106 = 106,
+    #[doc(hidden)]
+    UnknownValue107 = 107,
+    #[doc(hidden)]
+    UnknownValue108 = 108,
+    #[doc(hidden)]
+    UnknownValue109 = 109,
+    #[doc(hidden)]
+    UnknownValue110 = 110,
+    #[doc(hidden)]
+    UnknownValue111 = 111,
+    #[doc(hidden)]
+    UnknownValue112 = 112,
+    #[doc(hidden)]
+    UnknownValue113 = 113,
+    #[doc(hidden)]
+    UnknownValue114 = 114,
+    #[doc(hidden)]
+    UnknownValue115 = 115,
+    #[doc(hidden)]
+    UnknownValue116 = 116,
+    #[doc(hidden)]
+    UnknownValue117 = 117,
+    #[doc(hidden)]
+    UnknownValue118 = 118,
+    #[doc(hidden)]
+    UnknownValue119 = 119,
+    #[doc(hidden)]
+    UnknownValue120 = 120,
+    #[doc(hidden)]
+    UnknownValue121 = 121,
+    #[doc(hidden)]
+    UnknownValue122 = 122,
+    #[doc(hidden)]
+    UnknownValue123 = 123,
+    #[doc(hidden)]
+    UnknownValue124 = 124,
+    #[doc(hidden)]
+    UnknownValue125 = 125,
+    #[doc(hidden)]
+    UnknownValue126 = 126,
+    #[doc(hidden)]
+    UnknownValue127 = 127,
+    #[doc(hidden)]
+    UnknownValue128 = 128,
+    #[doc(hidden)]
+    UnknownValue129 = 129,
+    #[doc(hidden)]
+    UnknownValue130 = 130,
+    #[doc(hidden)]
+    UnknownValue131 = 131,
+    #[doc(hidden)]
+    UnknownValue132 = 132,
+    #[doc(hidden)]
+    UnknownValue133 = 133,
+    #[doc(hidden)]
+    UnknownValue134 = 134,
+    #[doc(hidden)]
+    UnknownValue135 = 135,
+    #[doc(hidden)]
+    UnknownValue136 = 136,
+    #[doc(hidden)]
+    UnknownValue137 = 137,
+    #[doc(hidden)]
+    UnknownValue138 = 138,
+    #[doc(hidden)]
+    UnknownValue139 = 139,
+    #[doc(hidden)]
+    UnknownValue140 = 140,
+    #[doc(hidden)]
+    UnknownValue141 = 141,
+    #[doc(hidden)]
+    UnknownValue142 = 142,
+    #[doc(hidden)]
+    UnknownValue143 = 143,
+    #[doc(hidden)]
+    UnknownValue144 = 144,
+    #[doc(hidden)]
+    UnknownValue145 = 145,
+    #[doc(hidden)]
+    UnknownValue146 = 146,
+    #[doc(hidden)]
+    UnknownValue147 = 147,
+    #[doc(hidden)]
+    UnknownValue148 = 148,
+    #[doc(hidden)]
+    UnknownValue149 = 149,
+    #[doc(hidden)]
+    UnknownValue150 = 150,
+    #[doc(hidden)]
+    UnknownValue151 = 151,
+    #[doc(hidden)]
+    UnknownValue152 = 152,
+    #[doc(hidden)]
+    UnknownValue153 = 153,
+    #[doc(hidden)]
+    UnknownValue154 = 154,
+    #[doc(hidden)]
+    UnknownValue155 = 155,
+    #[doc(hidden)]
+    UnknownValue156 = 156,
+    #[doc(hidden)]
+    UnknownValue157 = 157,
+    #[doc(hidden)]
+    UnknownValue158 = 158,
+    #[doc(hidden)]
+    UnknownValue159 = 159,
+    #[doc(hidden)]
+    UnknownValue160 = 160,
+    #[doc(hidden)]
+    UnknownValue161 = 161,
+    #[doc(hidden)]
+    UnknownValue162 = 162,
+    #[doc(hidden)]
+    UnknownValue163 = 163,
+    #[doc(hidden)]
+    UnknownValue164 = 164,
+    #[doc(hidden)]
+    UnknownValue165 = 165,
+    #[doc(hidden)]
+    UnknownValue166 = 166,
+    #[doc(hidden)]
+    UnknownValue167 = 167,
+    #[doc(hidden)]
+    UnknownValue168 = 168,
+    #[doc(hidden)]
+    UnknownValue169 = 169,
+    #[doc(hidden)]
+    UnknownValue170 = 170,
+    #[doc(hidden)]
+    UnknownValue171 = 171,
+    #[doc(hidden)]
+    UnknownValue172 = 172,
+    #[doc(hidden)]
+    UnknownValue173 = 173,
+    #[doc(hidden)]
+    UnknownValue174 = 174,
+    #[doc(hidden)]
+    UnknownValue175 = 175,
+    #[doc(hidden)]
+    UnknownValue176 = 176,
+    #[doc(hidden)]
+    UnknownValue177 = 177,
+    #[doc(hidden)]
+    UnknownValue178 = 178,
+    #[doc(hidden)]
+    UnknownValue179 = 179,
+    #[doc(hidden)]
+    UnknownValue180 = 180,
+    #[doc(hidden)]
+    UnknownValue181 = 181,
+    #[doc(hidden)]
+    UnknownValue182 = 182,
+    #[doc(hidden)]
+    UnknownValue183 = 183,
+    #[doc(hidden)]
+    UnknownValue184 = 184,
+    #[doc(hidden)]
+    UnknownValue185 = 185,
+    #[doc(hidden)]
+    UnknownValue186 = 186,
+    #[doc(hidden)]
+    UnknownValue187 = 187,
+    #[doc(hidden)]
+    UnknownValue188 = 188,
+    #[doc(hidden)]
+    UnknownValue189 = 189,
+    #[doc(hidden)]
+    UnknownValue190 = 190,
+    #[doc(hidden)]
+    UnknownValue191 = 191,
+    #[doc(hidden)]
+    UnknownValue192 = 192,
+    #[doc(hidden)]
+    UnknownValue193 = 193,
+    #[doc(hidden)]
+    UnknownValue194 = 194,
+    #[doc(hidden)]
+    UnknownValue195 = 195,
+    #[doc(hidden)]
+    UnknownValue196 = 196,
+    #[doc(hidden)]
+    UnknownValue197 = 197,
+    #[doc(hidden)]
+    UnknownValue198 = 198,
+    #[doc(hidden)]
+    UnknownValue199 = 199,
+    #[doc(hidden)]
+    UnknownValue200 = 200,
+    #[doc(hidden)]
+    UnknownValue201 = 201,
+    #[doc(hidden)]
+    UnknownValue202 = 202,
+    #[doc(hidden)]
+    UnknownValue203 = 203,
+    #[doc(hidden)]
+    UnknownValue204 = 204,
+    #[doc(hidden)]
+    UnknownValue205 = 205,
+    #[doc(hidden)]
+    UnknownValue206 = 206,
+    #[doc(hidden)]
+    UnknownValue207 = 207,
+    #[doc(hidden)]
+    UnknownValue208 = 208,
+    #[doc(hidden)]
+    UnknownValue209 = 209,
+    #[doc(hidden)]
+    UnknownValue210 = 210,
+    #[doc(hidden)]
+    UnknownValue211 = 211,
+    #[doc(hidden)]
+    UnknownValue212 = 212,
+    #[doc(hidden)]
+    UnknownValue213 = 213,
+    #[doc(hidden)]
+    UnknownValue214 = 214,
+    #[doc(hidden)]
+    UnknownValue215 = 215,
+    #[doc(hidden)]
+    UnknownValue216 = 216,
+    #[doc(hidden)]
+    UnknownValue217 = 217,
+    #[doc(hidden)]
+    UnknownValue218 = 218,
+    #[doc(hidden)]
+    UnknownValue219 = 219,
+    #[doc(hidden)]
+    UnknownValue220 = 220,
+    #[doc(hidden)]
+    UnknownValue221 = 221,
+    #[doc(hidden)]
+    UnknownValue222 = 222,
+    #[doc(hidden)]
+    UnknownValue223 = 223,
+    #[doc(hidden)]
+    UnknownValue224 = 224,
+    #[doc(hidden)]
+    UnknownValue225 = 225,
+    #[doc(hidden)]
+    UnknownValue226 = 226,
+    #[doc(hidden)]
+    UnknownValue227 = 227,
+    #[doc(hidden)]
+    UnknownValue228 = 228,
+    #[doc(hidden)]
+    UnknownValue229 = 229,
+    #[doc(hidden)]
+    UnknownValue230 = 230,
+    #[doc(hidden)]
+    UnknownValue231 = 231,
+    #[doc(hidden)]
+    UnknownValue232 = 232,
+    #[doc(hidden)]
+    UnknownValue233 = 233,
+    #[doc(hidden)]
+    UnknownValue234 = 234,
+    #[doc(hidden)]
+    UnknownValue235 = 235,
+    #[doc(hidden)]
+    UnknownValue236 = 236,
+    #[doc(hidden)]
+    UnknownValue237 = 237,
+    #[doc(hidden)]
+    UnknownValue238 = 238,
+    #[doc(hidden)]
+    UnknownValue239 = 239,
+    #[doc(hidden)]
+    UnknownValue240 = 240,
+    #[doc(hidden)]
+    UnknownValue241 = 241,
+    #[doc(hidden)]
+    UnknownValue242 = 242,
+    #[doc(hidden)]
+    UnknownValue243 = 243,
+    #[doc(hidden)]
+    UnknownValue244 = 244,
+    #[doc(hidden)]
+    UnknownValue245 = 245,
+    #[doc(hidden)]
+    UnknownValue246 = 246,
+    #[doc(hidden)]
+    UnknownValue247 = 247,
+    #[doc(hidden)]
+    UnknownValue248 = 248,
+    #[doc(hidden)]
+    UnknownValue249 = 249,
+    #[doc(hidden)]
+    UnknownValue250 = 250,
+    #[doc(hidden)]
+    UnknownValue251 = 251,
+    #[doc(hidden)]
+    UnknownValue252 = 252,
+    #[doc(hidden)]
+    UnknownValue253 = 253,
+    #[doc(hidden)]
+    UnknownValue254 = 254,
+    #[doc(hidden)]
+    UnknownValue255 = 255,
+}
+
+impl flatdata::helper::Int for GeoType {
+    const IS_SIGNED: bool = false;
+}
+
+
+
+#[derive(Clone)]
+pub struct GeoIndexArchive {
+    _storage: flatdata::StorageHandle,
+    z_order_index : &'static [super::osm::ZOrderIndexEntry],
+}
+
+impl GeoIndexArchive {
+    fn signature_name(archive_name: &str) -> String {
+        format!("{}.archive", archive_name)
+    }
+
+    #[inline]
+    pub fn z_order_index(&self) -> &[super::osm::ZOrderIndexEntry] {
+        self.z_order_index
+    }
+
+}
+
+impl ::std::fmt::Debug for GeoIndexArchive {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("GeoIndexArchive")
+            .field("z_order_index", &self.z_order_index())
+            .finish()
+    }
+}
+
+impl GeoIndexArchive {
+    pub fn open(storage: flatdata::StorageHandle)
+        -> ::std::result::Result<Self, flatdata::ResourceStorageError>
+    {
+        #[allow(unused_imports)]
+        use flatdata::SliceExt;
+        #[allow(unused_variables)]
+        use flatdata::ResourceStorageError as Error;
+        // extend lifetime since Rust cannot know that we reference a cache here
+        #[allow(unused_variables)]
+        let extend = |x : Result<&[u8], Error>| -> Result<&'static [u8], Error> {x.map(|x| unsafe{std::mem::transmute(x)})};
+
+        storage.read(&Self::signature_name("GeoIndexArchive"), schema::geo_indexarchive::GEO_INDEXARCHIVE)?;
+
+        let z_order_index = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("z_order_index", schema::geo_indexarchive::resources::Z_ORDER_INDEX));
+            check("z_order_index", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm::ZOrderIndexEntry]>::from_bytes(x)))?
+        };
+
+        Ok(Self {
+            _storage: storage,
+            z_order_index,
+        })
+    }
+}
+
+/// Builder for creating [`GeoIndexArchive`] archives.
+///
+///[`GeoIndexArchive`]: struct.GeoIndexArchive.html
+#[derive(Clone, Debug)]
+pub struct GeoIndexArchiveBuilder {
+    storage: flatdata::StorageHandle
+}
+
+impl GeoIndexArchiveBuilder {
+    #[inline]
+    /// Stores [`z_order_index`] in the archive.
+    ///
+    /// [`z_order_index`]: struct.GeoIndexArchive.html#method.z_order_index
+    pub fn set_z_order_index(&self, vector: &[super::osm::ZOrderIndexEntry]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("z_order_index", schema::geo_indexarchive::resources::Z_ORDER_INDEX, vector.as_bytes())
+    }
+
+    /// Opens [`z_order_index`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`z_order_index`]: struct.GeoIndexArchive.html#method.z_order_index
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_z_order_index(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm::ZOrderIndexEntry>> {
+        flatdata::create_external_vector(&*self.storage, "z_order_index", schema::geo_indexarchive::resources::Z_ORDER_INDEX)
+    }
+
+}
+
+impl GeoIndexArchiveBuilder {
+    pub fn new(
+        storage: flatdata::StorageHandle,
+    ) -> Result<Self, flatdata::ResourceStorageError> {
+        flatdata::create_archive("GeoIndexArchive", schema::geo_indexarchive::GEO_INDEXARCHIVE, &storage)?;
+        Ok(Self { storage })
+    }
+}
+
 
 
 
@@ -1756,7 +2626,7 @@ impl<'a> RelationMembersBuilder<'a> {
 pub struct RelationMembers {}
 
 impl flatdata::VariadicIndex for RelationMembers {
-    type Index = super::_builtin::multivector::IndexType40;
+    type Index = super::osm::_builtin::multivector::IndexType40;
 }
 
 impl<'a> flatdata::VariadicStruct<'a> for RelationMembers {
@@ -1815,6 +2685,8 @@ pub struct Osm {
     stringtable : flatdata::RawData<'static>,
     ids : Option<super::osm::Ids
 >,
+    spatial_index : super::osm::GeoIndexArchive
+,
 }
 
 impl Osm {
@@ -1904,6 +2776,11 @@ impl Osm {
         self.ids.as_ref()
     }
 
+    #[inline]
+    pub fn spatial_index(&self) -> &super::osm::GeoIndexArchive {
+        &self.spatial_index
+    }
+
 }
 
 impl ::std::fmt::Debug for Osm {
@@ -1919,6 +2796,7 @@ impl ::std::fmt::Debug for Osm {
             .field("nodes_index", &self.nodes_index())
             .field("stringtable", &self.stringtable())
             .field("ids", &self.ids())
+            .field("spatial_index", &self.spatial_index())
             .finish()
     }
 }
@@ -1970,7 +2848,7 @@ impl Osm {
             let result = match (index, data) {
                 (Ok(index), Ok(data)) => {
                     Ok(flatdata::MultiArrayView::new(
-                        <&[super::_builtin::multivector::IndexType40]>::from_bytes(index)?,
+                        <&[super::osm::_builtin::multivector::IndexType40]>::from_bytes(index)?,
                         data
                     ))
                 }
@@ -2012,6 +2890,11 @@ impl Osm {
             let max_size = None;
             check("ids", |_| 0, max_size, super::osm::Ids::open(storage.subdir("ids")))?
         };
+        let spatial_index = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            check("spatial_index", |_| 0, max_size, super::osm::GeoIndexArchive::open(storage.subdir("spatial_index")))?
+        };
 
         Ok(Self {
             _storage: storage,
@@ -2025,6 +2908,7 @@ impl Osm {
             nodes_index,
             stringtable,
             ids,
+            spatial_index,
         })
     }
 }
@@ -2210,6 +3094,15 @@ impl OsmBuilder {
         super::osm::IdsBuilder::new(storage)
     }
 
+    /// Stores [`spatial_index`] in the archive.
+    ///
+    /// [`spatial_index`]: struct.Osm.html#method.spatial_index
+    #[inline]
+    pub fn spatial_index(&self) -> Result<super::osm::GeoIndexArchiveBuilder, flatdata::ResourceStorageError> {
+        let storage = self.storage.subdir("spatial_index");
+        super::osm::GeoIndexArchiveBuilder::new(storage)
+    }
+
 }
 
 impl OsmBuilder {
@@ -2224,6 +3117,68 @@ impl OsmBuilder {
 
 #[doc(hidden)]
 pub mod schema {
+pub mod geo_indexarchive {
+
+pub const GEO_INDEXARCHIVE: &str = r#"namespace osm {
+enum GeoType : u8 : 8
+{
+    Node = 0,
+    Way = 1,
+    Relation = 2,
+}
+}
+
+namespace osm {
+struct ZOrderIndexEntry
+{
+    z_order : u64 : 64;
+    tag : .osm.GeoType : 8;
+    value : u64 : 64;
+}
+}
+
+namespace osm {
+const u32 Z_ORDER_RESOLUTION = 12;
+}
+
+namespace osm {
+archive GeoIndexArchive
+{
+    z_order_index : vector< .osm.ZOrderIndexEntry >;
+}
+}
+
+"#;
+
+pub mod resources {
+pub const Z_ORDER_INDEX: &str = r#"namespace osm {
+enum GeoType : u8 : 8
+{
+    Node = 0,
+    Way = 1,
+    Relation = 2,
+}
+}
+
+namespace osm {
+struct ZOrderIndexEntry
+{
+    z_order : u64 : 64;
+    tag : .osm.GeoType : 8;
+    value : u64 : 64;
+}
+}
+
+namespace osm {
+archive GeoIndexArchive
+{
+    z_order_index : vector< .osm.ZOrderIndexEntry >;
+}
+}
+
+"#;
+}
+}
 pub mod ids {
 
 pub const IDS: &str = r#"namespace osm {
@@ -2231,6 +3186,10 @@ struct Id
 {
     value : u64 : 40;
 }
+}
+
+namespace osm {
+const u32 Z_ORDER_RESOLUTION = 12;
 }
 
 namespace osm {
@@ -2400,11 +3359,40 @@ struct Id
 }
 
 namespace osm {
+const u32 Z_ORDER_RESOLUTION = 12;
+}
+
+namespace osm {
 archive Ids
 {
     nodes : vector< .osm.Id >;
     ways : vector< .osm.Id >;
     relations : vector< .osm.Id >;
+}
+}
+
+namespace osm {
+enum GeoType : u8 : 8
+{
+    Node = 0,
+    Way = 1,
+    Relation = 2,
+}
+}
+
+namespace osm {
+struct ZOrderIndexEntry
+{
+    z_order : u64 : 64;
+    tag : .osm.GeoType : 8;
+    value : u64 : 64;
+}
+}
+
+namespace osm {
+archive GeoIndexArchive
+{
+    z_order_index : vector< .osm.ZOrderIndexEntry >;
 }
 }
 
@@ -2440,6 +3428,7 @@ archive Osm
     stringtable : raw_data;
     @optional
     ids : archive .osm.Ids;
+    spatial_index : archive .osm.GeoIndexArchive;
 }
 }
 
@@ -2645,6 +3634,10 @@ struct Id
 }
 
 namespace osm {
+const u32 Z_ORDER_RESOLUTION = 12;
+}
+
+namespace osm {
 archive Ids
 {
     nodes : vector< .osm.Id >;
@@ -2662,118 +3655,44 @@ archive Osm
 }
 
 "#;
-}
-}
-}
-}
-
-#[doc(hidden)]
-pub mod _builtin {
-#[allow(unused_imports)]
-use flatdata::{flatdata_read_bytes, flatdata_write_bytes};
-
-
-#[allow(missing_docs)]
-pub mod multivector {
-#[allow(unused_imports)]
-use flatdata::{flatdata_read_bytes, flatdata_write_bytes};
-
-
-/// Builtin type to for MultiVector index
-#[repr(transparent)]
-pub struct IndexType40 {
-    data: [u8; 5],
-}
-
-impl IndexType40 {
-    /// Unsafe since the struct might not be self-contained
-    pub unsafe fn new_unchecked( ) -> Self {
-        Self{data : [0; 5]}
-    }
-}
-
-impl flatdata::Struct for IndexType40 {
-    unsafe fn create_unchecked( ) -> Self {
-        Self{data : [0; 5]}
-    }
-
-    const SIZE_IN_BYTES: usize = 5;
-    const IS_OVERLAPPING_WITH_NEXT : bool = true;
-}
-
-impl flatdata::Overlap for IndexType40 {}
-
-impl IndexType40 {
-    /// First element of the range [`range`].
-    ///
-    /// [`range`]: #method.range
-    #[inline]
-    pub fn value(&self) -> u64 {
-        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 40);
-        unsafe { std::mem::transmute::<u64, u64>(value) }
-    }
-
-    #[inline]
-    pub fn range(&self) -> std::ops::Range<u64> {
-        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 40);
-        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 0 + 5 * 8, 40);
-        start..end
-    }
-
-}
-
-impl std::fmt::Debug for IndexType40 {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("IndexType40")
-            .field("value", &self.value())
-            .finish()
-    }
-}
-
-impl std::cmp::PartialEq for IndexType40 {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.value() == other.value()     }
-}
-
-impl IndexType40 {
-    /// First element of the range [`range`].
-    ///
-    /// [`range`]: struct.IndexType40Ref.html#method.range
-    #[inline]
-    #[allow(missing_docs)]
-    pub fn set_value(&mut self, value: u64) {
-        flatdata_write_bytes!(u64; value, self.data, 0, 40)
-    }
-
-
-    /// Copies the data from `other` into this struct.
-    #[inline]
-    pub fn fill_from(&mut self, other: &IndexType40) {
-        self.set_value(other.value());
-    }
-}
-
-impl flatdata::IndexStruct for IndexType40 {
-    #[inline]
-    fn range(&self) -> std::ops::Range<usize> {
-        let range = self.range();
-        range.start as usize..range.end as usize
-    }
-
-    #[inline]
-    fn set_index(&mut self, value: usize) {
-        self.set_value(value as u64);
-    }
-}
-
-
-#[doc(hidden)]
-pub mod schema {
+pub const SPATIAL_INDEX: &str = r#"namespace osm {
+enum GeoType : u8 : 8
+{
+    Node = 0,
+    Way = 1,
+    Relation = 2,
 }
 }
 
-#[doc(hidden)]
-pub mod schema {
+namespace osm {
+struct ZOrderIndexEntry
+{
+    z_order : u64 : 64;
+    tag : .osm.GeoType : 8;
+    value : u64 : 64;
+}
+}
+
+namespace osm {
+const u32 Z_ORDER_RESOLUTION = 12;
+}
+
+namespace osm {
+archive GeoIndexArchive
+{
+    z_order_index : vector< .osm.ZOrderIndexEntry >;
+}
+}
+
+namespace osm {
+archive Osm
+{
+    spatial_index : archive .osm.GeoIndexArchive;
+}
+}
+
+"#;
+}
+}
 }
 }
