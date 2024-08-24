@@ -179,6 +179,24 @@ struct Id {
     value: u64 : 40;
 }
 
+enum GeoType : u8 {
+    Node = 0,
+    Way = 1,
+    Relation = 2
+}
+
+struct ZOrderIndexEntry {
+    z_order : u64 : 64;
+    tag: GeoType: 8;
+    value: u64: 64;
+}
+
+const u32 Z_ORDER_RESOLUTION = 12;
+
+archive GeoIndexArchive {
+    z_order_index : vector< ZOrderIndexEntry >;
+}
+
 /**
  * An optional sub-archive storing the original OSM ids of nodes, ways, and relations
  */
@@ -312,5 +330,7 @@ archive Osm {
 
     @optional
     ids: archive Ids;
+
+    spatial_index: archive GeoIndexArchive;
 }
 } // namespace osm
