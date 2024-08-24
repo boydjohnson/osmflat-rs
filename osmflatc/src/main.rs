@@ -11,13 +11,17 @@ use crate::strings::StringTable;
 
 use clap::Parser;
 use flatdata::FileResourceStorage;
+use geo::BoundingRect;
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use log::{error, info};
 use memmap2::Mmap;
+use osmflat::ZOrderIndexEntry;
+use osmflat::Z_ORDER_RESOLUTION;
+use space_time::xzorder::xz2_sfc::XZ2SFC;
 
 use ahash::AHashMap;
-use std::collections::hash_map;
+use std::collections::{hash_map, HashMap};
 use std::fs::File;
 use std::io;
 use std::str;
@@ -169,10 +173,13 @@ fn serialize_dense_nodes(
     nodes: &mut flatdata::ExternalVector<osmflat::Node>,
     node_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
     nodes_id_to_idx: &mut ids::IdTableBuilder,
+    spatial_index: &mut Vec<osmflat::ZOrderIndexEntry>,
+    nodes_to_lat_lon: &mut HashMap<i64, (f64, f64)>,
     stringtable: &mut StringTable,
     tags: &mut TagSerializer,
 ) -> Result<Stats, Error> {
     let mut stats = Stats::default();
+    let curve = XZ2SFC::wgs84(Z_ORDER_RESOLUTION);
     let string_refs = add_string_table(&block.stringtable, stringtable)?;
     for group in block.primitivegroup.iter() {
         let dense_nodes = group.dense.as_ref().unwrap();
@@ -199,12 +206,28 @@ fn serialize_dense_nodes(
 
             lat += dense_nodes.lat[i];
             lon += dense_nodes.lon[i];
-            node.set_lat(
-                ((lat_offset + (i64::from(pbf_granularity) * lat)) / granularity as i64) as i32,
-            );
-            node.set_lon(
-                ((lon_offset + (i64::from(pbf_granularity) * lon)) / granularity as i64) as i32,
-            );
+
+            let lat_ =
+                ((lat_offset + (i64::from(pbf_granularity) * lat)) / granularity as i64) as i32;
+
+            let lon_ =
+                ((lon_offset + (i64::from(pbf_granularity) * lon)) / granularity as i64) as i32;
+
+            node.set_lat(lat_);
+            node.set_lon(lon_);
+
+            let lat_f64 = lat_ as f64 / 1e7;
+            let lon_f64 = lon_ as f64 / 1e7;
+            nodes_to_lat_lon.insert(id, (lon_f64, lat_f64));
+            let z_order_index = curve.index(lon_f64, lat_f64, lon_f64, lat_f64);
+
+            let mut entry = ZOrderIndexEntry::new();
+
+            entry.set_tag(osmflat::GeoType::Node);
+            entry.set_z_order(z_order_index);
+            entry.set_value(index);
+
+            spatial_index.push(entry);
 
             if tags_offset < dense_nodes.keys_vals.len() {
                 node.set_tag_first_idx(tags.next_index());
@@ -257,11 +280,17 @@ fn serialize_ways(
     ways: &mut flatdata::ExternalVector<osmflat::Way>,
     way_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
     ways_id_to_idx: &mut ids::IdTableBuilder,
+    spatial_index: &mut Vec<osmflat::ZOrderIndexEntry>,
+    nodes_to_lat_lon: &mut HashMap<i64, (f64, f64)>,
+    ways_to_lat_lon: &mut HashMap<i64, [(f64, f64); 2]>,
     stringtable: &mut StringTable,
     tags: &mut TagSerializer,
     nodes_index: &mut flatdata::ExternalVector<osmflat::NodeIndex>,
 ) -> Result<Stats, Error> {
     let mut stats = Stats::default();
+
+    let curve = XZ2SFC::wgs84(Z_ORDER_RESOLUTION);
+
     let string_refs = add_string_table(&block.stringtable, stringtable)?;
     let mut nodes_idx = nodes_id_to_idx.iter().cloned();
     for group in &block.primitivegroup {
@@ -285,8 +314,36 @@ fn serialize_ways(
             }
 
             way.set_ref_first_idx(nodes_index.len() as u64);
-            for _ in &pbf_way.refs {
+
+            let mut lat_lons = vec![];
+            let mut f = 0;
+            for v in &pbf_way.refs {
                 nodes_index.grow()?.set_value(nodes_idx.next().unwrap());
+                f += v;
+                lat_lons.push(nodes_to_lat_lon[&f]);
+            }
+
+            let points: geo::MultiPoint<_> = lat_lons.into();
+
+            if let Some(bbox) = points.bounding_rect() {
+                let mut entry = ZOrderIndexEntry::new();
+
+                ways_to_lat_lon.insert(
+                    pbf_way.id,
+                    [(bbox.min().x, bbox.min().y), (bbox.max().x, bbox.max().y)],
+                );
+
+                entry.set_z_order(curve.index(
+                    bbox.min().x,
+                    bbox.min().y,
+                    bbox.max().x,
+                    bbox.max().y,
+                ));
+
+                entry.set_tag(osmflat::GeoType::Way);
+                entry.set_value(index);
+
+                spatial_index.push(entry);
             }
         }
         stats.num_ways += group.ways.len();
@@ -327,12 +384,18 @@ fn serialize_relations(
     ways_id_to_idx: &ids::IdTable,
     relations_id_to_idx: &ids::IdTable,
     stringtable: &mut StringTable,
+    spatial_index: &mut Vec<osmflat::ZOrderIndexEntry>,
+    nodes_to_lat_lon: &mut HashMap<i64, (f64, f64)>,
+    way_to_lat_lon: &mut HashMap<i64, [(f64, f64); 2]>,
     relations: &mut flatdata::ExternalVector<osmflat::Relation>,
     relation_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
     relation_members: &mut flatdata::MultiVector<osmflat::RelationMembers>,
     tags: &mut TagSerializer,
 ) -> Result<Stats, Error> {
     let mut stats = Stats::default();
+
+    let curve = XZ2SFC::wgs84(Z_ORDER_RESOLUTION);
+
     let string_refs = add_string_table(&block.stringtable, stringtable)?;
     for group in &block.primitivegroup {
         for pbf_relation in &group.relations {
@@ -340,6 +403,8 @@ fn serialize_relations(
             if let Some(ids) = relation_ids {
                 ids.grow()?.set_value(pbf_relation.id as u64);
             }
+
+            let index = relations_id_to_idx.get(pbf_relation.id as u64).unwrap();
 
             debug_assert_eq!(
                 pbf_relation.keys.len(),
@@ -362,6 +427,9 @@ fn serialize_relations(
 
             let mut memid = 0;
             let mut members = relation_members.grow()?;
+
+            let mut member_lat_lons = vec![];
+
             for i in 0..pbf_relation.roles_sid.len() {
                 memid += pbf_relation.memids[i];
 
@@ -372,6 +440,10 @@ fn serialize_relations(
                     osmpbf::relation::MemberType::Node => {
                         let idx = nodes_id_to_idx.get(memid as u64);
                         stats.num_unresolved_node_ids = idx.is_none() as usize;
+
+                        if let Some(&ll) = nodes_to_lat_lon.get(&memid) {
+                            member_lat_lons.push(ll);
+                        }
 
                         let member = members.add_node_member();
                         member.set_node_idx(idx);
@@ -395,6 +467,25 @@ fn serialize_relations(
                     }
                 }
             }
+
+            let points: geo::MultiPoint<_> = member_lat_lons.into();
+
+            if let Some(bbox) = points.bounding_rect() {
+                let mut entry = ZOrderIndexEntry::new();
+
+                entry.set_z_order(curve.index(
+                    bbox.min().x,
+                    bbox.min().y,
+                    bbox.max().x,
+                    bbox.max().y,
+                ));
+
+                entry.set_tag(osmflat::GeoType::Relation);
+                entry.set_value(index);
+
+                spatial_index.push(entry);
+            }
+
             stats.num_relations += 1;
         }
     }
@@ -406,6 +497,8 @@ fn serialize_dense_node_blocks(
     builder: &osmflat::OsmBuilder,
     granularity: i32,
     mut node_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
+    spatial_index: &mut Vec<osmflat::ZOrderIndexEntry>,
+    nodes_to_lat_lon: &mut HashMap<i64, (f64, f64)>,
     blocks: Vec<BlockIndex>,
     data: &[u8],
     tags: &mut TagSerializer,
@@ -428,6 +521,8 @@ fn serialize_dense_node_blocks(
                 &mut nodes,
                 &mut node_ids,
                 &mut nodes_id_to_idx,
+                spatial_index,
+                nodes_to_lat_lon,
                 stringtable,
                 tags,
             )?;
@@ -461,6 +556,9 @@ fn serialize_way_blocks(
     blocks: Vec<BlockIndex>,
     data: &[u8],
     nodes_id_to_idx: &ids::IdTable,
+    spatial_index: &mut Vec<osmflat::ZOrderIndexEntry>,
+    nodes_to_lat_lon: &mut HashMap<i64, (f64, f64)>,
+    ways_to_lat_lon: &mut HashMap<i64, [(f64, f64); 2]>,
     tags: &mut TagSerializer,
     stringtable: &mut StringTable,
     stats: &mut Stats,
@@ -487,6 +585,9 @@ fn serialize_way_blocks(
                 &mut ways,
                 &mut way_ids,
                 &mut ways_id_to_idx,
+                spatial_index,
+                nodes_to_lat_lon,
+                ways_to_lat_lon,
                 stringtable,
                 tags,
                 &mut nodes_index,
@@ -524,6 +625,9 @@ fn serialize_relation_blocks(
     data: &[u8],
     nodes_id_to_idx: &ids::IdTable,
     ways_id_to_idx: &ids::IdTable,
+    spatial_index: &mut Vec<osmflat::ZOrderIndexEntry>,
+    nodes_to_lat_lon: &mut HashMap<i64, (f64, f64)>,
+    way_to_lat_lon: &mut HashMap<i64, [(f64, f64); 2]>,
     tags: &mut TagSerializer,
     stringtable: &mut StringTable,
     stats: &mut Stats,
@@ -549,6 +653,9 @@ fn serialize_relation_blocks(
                 ways_id_to_idx,
                 &relations_id_to_idx,
                 stringtable,
+                spatial_index,
+                nodes_to_lat_lon,
+                way_to_lat_lon,
                 &mut relations,
                 &mut relation_ids,
                 &mut relation_members,
@@ -663,10 +770,18 @@ fn run(args: args::Args) -> Result<(), Error> {
         relation_ids = Some(ids_archive.start_relations()?);
     }
 
+    let spatial_index = builder.spatial_index()?;
+
+    let mut spatial = vec![];
+    let mut nodes_to_lat_lon = HashMap::default();
+    let mut ways_to_lat_lon = HashMap::default();
+
     let nodes_id_to_idx = serialize_dense_node_blocks(
         &builder,
         greatest_common_granularity,
         node_ids,
+        &mut spatial,
+        &mut nodes_to_lat_lon,
         pbf_dense_nodes,
         &input_data,
         &mut tags,
@@ -680,6 +795,9 @@ fn run(args: args::Args) -> Result<(), Error> {
         pbf_ways,
         &input_data,
         &nodes_id_to_idx,
+        &mut spatial,
+        &mut nodes_to_lat_lon,
+        &mut ways_to_lat_lon,
         &mut tags,
         &mut stringtable,
         &mut stats,
@@ -692,6 +810,9 @@ fn run(args: args::Args) -> Result<(), Error> {
         &input_data,
         &nodes_id_to_idx,
         &ways_id_to_idx,
+        &mut spatial,
+        &mut nodes_to_lat_lon,
+        &mut ways_to_lat_lon,
         &mut tags,
         &mut stringtable,
         &mut stats,
@@ -699,6 +820,10 @@ fn run(args: args::Args) -> Result<(), Error> {
 
     // Finalize data structures
     tags.close(); // drop the reference to stringtable
+
+    spatial.sort_unstable_by_key(|entry| entry.z_order());
+
+    spatial_index.set_z_order_index(&spatial)?;
 
     info!("Writing stringtable to disk...");
     builder.set_stringtable(&stringtable.into_bytes())?;
