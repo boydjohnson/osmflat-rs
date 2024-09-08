@@ -16,6 +16,7 @@ edition = "2021"
 
 [dependencies]
 flatdata = "0.5.3"
+space-time = "0.3.0"
 
 [dev-dependencies]
 clap = { version = "4.1.4", features = ["derive"] }

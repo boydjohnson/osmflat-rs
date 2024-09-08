@@ -38,9 +38,11 @@
 // generated osm module
 include!("osmflat_generated.rs");
 
+mod spatial;
 mod tags;
 
 pub use crate::osm::*;
+pub use crate::spatial::*;
 pub use crate::tags::*;
 
 // re-export what is needed from flatdata to use osmflat
