@@ -17,6 +17,10 @@ copied and modified.
 
 * `pub-names` - shows the names and addresses of all pubs.
 * `road-length` - calculates the length of the road network in the input archive.
+* `spatial` - queries nodes, ways, or relations by bounding box using the
+  archive's spatial ordering. Note that negative coordinates must use the
+  `--lon-min=-93.3` form so they are not parsed as flags, e.g.:
+  `spatial archive.osmflat --lon-min=-93.3 --lon-max=-93.2 --lat-min=44.9 --lat-max=45.0 --osm-type node`
 
 ## Rendering
 
