@@ -34,6 +34,14 @@ pub fn bbox_index(curve: &XZ2SFC, min_x: f64, min_y: f64, max_x: f64, max_y: f64
     curve.index(min_x, min_y, max_x, max_y)
 }
 
+/// Sentinel bounding box stored for relations that have no resolvable member
+/// geometry (every member lies outside the extract). It is an inverted box
+/// using unreachable coordinates, so it never overlaps a query and the relation
+/// is never returned spatially — but the relation is still present in the
+/// archive and readable by iteration or id. The compiler writes this value and
+/// the query side recognizes it; the two must agree.
+pub const RELATION_NO_BBOX: [i32; 4] = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
+
 /// Return [Node]s from the archive that are inside the
 /// bounding box.
 pub fn find_nodes_by_bounding_box(
@@ -178,14 +186,33 @@ pub fn find_ways_by_bounding_box(
         .map(move |i| &archive.ways()[i])
 }
 
+/// Bounding box of a relation in degrees, or `None` if it carries the
+/// [`RELATION_NO_BBOX`] sentinel (no resolvable member geometry).
+fn relation_bbox(relation: &Relation, coord_scale: f64) -> Option<(f64, f64, f64, f64)> {
+    let raw = [
+        relation.min_lon(),
+        relation.min_lat(),
+        relation.max_lon(),
+        relation.max_lat(),
+    ];
+    if raw == RELATION_NO_BBOX {
+        return None;
+    }
+    Some((
+        raw[0] as f64 / coord_scale,
+        raw[1] as f64 / coord_scale,
+        raw[2] as f64 / coord_scale,
+        raw[3] as f64 / coord_scale,
+    ))
+}
+
 fn spatial_index_relation(curve: &XZ2SFC, relation: &Relation, coord_scale: f64) -> u64 {
-    bbox_index(
-        curve,
-        relation.min_lon() as f64 / coord_scale,
-        relation.min_lat() as f64 / coord_scale,
-        relation.max_lon() as f64 / coord_scale,
-        relation.max_lat() as f64 / coord_scale,
-    )
+    // Sentinel relations sort last and are never matched; they share the key
+    // the compiler used, keeping the binary search monotonic.
+    match relation_bbox(relation, coord_scale) {
+        Some((min_x, min_y, max_x, max_y)) => bbox_index(curve, min_x, min_y, max_x, max_y),
+        None => u64::MAX,
+    }
 }
 
 /// Return [Relation]s in the archive whose bounding box overlaps the query box.
@@ -216,15 +243,13 @@ pub fn find_relations_by_bounding_box(
 
             relations[lower..(lower + upper_relative)].iter()
         })
-        .filter(move |r| {
+        .filter(move |r| match relation_bbox(r, coord_scale) {
             // Exact overlap test to drop the false positives the curve ranges
-            // over-select.
-            let min_x = r.min_lon() as f64 / coord_scale;
-            let min_y = r.min_lat() as f64 / coord_scale;
-            let max_x = r.max_lon() as f64 / coord_scale;
-            let max_y = r.max_lat() as f64 / coord_scale;
-
-            !(max_x < xmin || min_x > xmax || max_y < ymin || min_y > ymax)
+            // over-select. Sentinel (no-location) relations are never returned.
+            Some((min_x, min_y, max_x, max_y)) => {
+                !(max_x < xmin || min_x > xmax || max_y < ymin || min_y > ymax)
+            }
+            None => false,
         })
 }
 
@@ -251,12 +276,12 @@ mod tests {
     ///
     /// - `node_lonlat`: `(lon, lat)` per node, in degrees.
     /// - `ways`: each way as a list of indices into `node_lonlat`.
-    /// - `relation_bboxes`: each relation as `(min_lon, min_lat, max_lon,
-    ///   max_lat)`.
+    /// - `relation_bboxes`: each relation as `Some((min_lon, min_lat, max_lon,
+    ///   max_lat))`, or `None` for a no-location (sentinel) relation.
     fn build_archive(
         node_lonlat: &[(f64, f64)],
         ways: &[Vec<usize>],
-        relation_bboxes: &[(f64, f64, f64, f64)],
+        relation_bboxes: &[Option<(f64, f64, f64, f64)>],
     ) -> Osm {
         let storage = MemoryResourceStorage::new("/test");
         let builder = OsmBuilder::new(storage.clone()).unwrap();
@@ -325,22 +350,26 @@ mod tests {
         builder.set_ways(&way_vec).unwrap();
         builder.set_nodes_index(&nodes_index_vec).unwrap();
 
-        // Relations, ordered by the bounding-box curve.
+        // Relations, ordered by the bounding-box curve; no-location relations
+        // get the sentinel mbb and sort last (key u64::MAX).
+        let rel_key = |bbox: Option<(f64, f64, f64, f64)>| match bbox {
+            Some((a, b, c, d)) => bbox_index(&wcurve, a, b, c, d),
+            None => u64::MAX,
+        };
         let mut rorder: Vec<usize> = (0..relation_bboxes.len()).collect();
-        rorder.sort_by_key(|&i| {
-            let (a, b, c, d) = relation_bboxes[i];
-            bbox_index(&wcurve, a, b, c, d)
-        });
+        rorder.sort_by_key(|&i| rel_key(relation_bboxes[i]));
         let mut rel_vec: Vec<Relation> = rorder
             .iter()
             .map(|&ri| {
-                let (a, b, c, d) = relation_bboxes[ri];
+                let mbb = relation_bboxes[ri]
+                    .map(|(a, b, c, d)| [scale(a), scale(b), scale(c), scale(d)])
+                    .unwrap_or(RELATION_NO_BBOX);
                 let mut r = unsafe { Relation::new_unchecked() };
                 r.set_tag_first_idx(0);
-                r.set_min_lon(scale(a));
-                r.set_min_lat(scale(b));
-                r.set_max_lon(scale(c));
-                r.set_max_lat(scale(d));
+                r.set_min_lon(mbb[0]);
+                r.set_min_lat(mbb[1]);
+                r.set_max_lon(mbb[2]);
+                r.set_max_lat(mbb[3]);
                 r
             })
             .collect();
@@ -402,8 +431,8 @@ mod tests {
     #[test]
     fn finds_relations_overlapping_box() {
         let relations = vec![
-            (-93.2, 44.9, -92.9, 45.2),  // overlaps
-            (-100.0, 30.0, -80.0, 40.0), // far south, no overlap
+            Some((-93.2, 44.9, -92.9, 45.2)),  // overlaps
+            Some((-100.0, 30.0, -80.0, 40.0)), // far south, no overlap
         ];
         let archive = build_archive(&[], &[], &relations);
 
@@ -422,6 +451,24 @@ mod tests {
         assert_eq!(found.len(), 1, "expected one overlapping relation");
         assert!((found[0].0 - -93.2).abs() < 1e-6);
         assert!((found[0].3 - 45.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sentinel_relation_is_never_returned() {
+        // One located relation overlapping the box, one no-location relation.
+        let relations = vec![Some((-93.2, 44.9, -92.9, 45.2)), None];
+        let archive = build_archive(&[], &[], &relations);
+
+        // The query over the located relation returns exactly it, not the sentinel.
+        assert_eq!(
+            find_relations_by_bounding_box(&archive, -93.5, 44.4, -92.4, 45.5).count(),
+            1
+        );
+        // A query over null island must not surface the sentinel either.
+        assert_eq!(
+            find_relations_by_bounding_box(&archive, -0.001, -0.001, 0.001, 0.001).count(),
+            0
+        );
     }
 
     #[test]

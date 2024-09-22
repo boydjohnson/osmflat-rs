@@ -1,13 +1,31 @@
 mod args;
-mod ids;
+mod error;
 mod osmpbf;
 mod parallel;
+mod processing;
 mod stats;
+mod storage;
 mod strings;
 
 use crate::osmpbf::{build_block_index, read_block, BlockIndex, BlockType};
-use crate::stats::Stats;
+use crate::processing::TempDataCodec;
+use crate::stats::{MissingRefs, Stats};
 use crate::strings::StringTable;
+use geo::BoundingRect;
+use geo::MultiPoint;
+use osmpbf::PrimitiveBlock;
+use processing::create_db;
+use processing::node::serialize_dense_node_blocks;
+use processing::node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC};
+use processing::storage::{OsmIdKey, OsmKey};
+use processing::way::serialize_way_blocks;
+use processing::way::storage::{WayIdToIdxTDC, WayIdToMbbTDC};
+use processing::Key;
+use processing::RocksDBSync;
+use processing::{RELATIONS, RELATIONS_STRING_REFS};
+use prost::Message;
+use space_time::xzorder::xz2_sfc::XZ2SFC;
+use storage::{break_node_lon_lat, break_relation_values, create_relation_values, RelationInfo};
 
 use clap::Parser;
 use flatdata::FileResourceStorage;
@@ -17,12 +35,16 @@ use log::{error, info};
 use memmap2::Mmap;
 
 use ahash::AHashMap;
-use std::collections::hash_map;
+use rocksdb::DB;
+use std::collections::{hash_map, VecDeque};
 use std::fs::File;
 use std::io;
+use std::path::Path;
 use std::str;
 
 type Error = Box<dyn std::error::Error>;
+
+const BATCH_SIZE: usize = 5000;
 
 fn serialize_header(
     header_block: &osmpbf::HeaderBlock,
@@ -163,142 +185,19 @@ fn add_string_table(
     Ok(result)
 }
 
-fn serialize_dense_nodes(
-    block: &osmpbf::PrimitiveBlock,
-    granularity: i32,
-    nodes: &mut flatdata::ExternalVector<osmflat::Node>,
-    node_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
-    nodes_id_to_idx: &mut ids::IdTableBuilder,
-    stringtable: &mut StringTable,
-    tags: &mut TagSerializer,
-) -> Result<Stats, Error> {
-    let mut stats = Stats::default();
-    let string_refs = add_string_table(&block.stringtable, stringtable)?;
-    for group in block.primitivegroup.iter() {
-        let dense_nodes = group.dense.as_ref().unwrap();
-
-        let pbf_granularity = block.granularity.unwrap_or(100);
-        let lat_offset = block.lat_offset.unwrap_or(0);
-        let lon_offset = block.lon_offset.unwrap_or(0);
-        let mut lat = 0;
-        let mut lon = 0;
-
-        let mut tags_offset = 0;
-
-        let mut id = 0;
-        for i in 0..dense_nodes.id.len() {
-            id += dense_nodes.id[i];
-
-            let index = nodes_id_to_idx.insert(id as u64);
-            assert_eq!(index as usize, nodes.len());
-
-            let node = nodes.grow()?;
-            if let Some(ids) = node_ids {
-                ids.grow()?.set_value(id as u64);
-            }
-
-            lat += dense_nodes.lat[i];
-            lon += dense_nodes.lon[i];
-            node.set_lat(
-                ((lat_offset + (i64::from(pbf_granularity) * lat)) / granularity as i64) as i32,
-            );
-            node.set_lon(
-                ((lon_offset + (i64::from(pbf_granularity) * lon)) / granularity as i64) as i32,
-            );
-
-            if tags_offset < dense_nodes.keys_vals.len() {
-                node.set_tag_first_idx(tags.next_index());
-                loop {
-                    let k = dense_nodes.keys_vals[tags_offset];
-                    tags_offset += 1;
-
-                    if k == 0 {
-                        break; // separator
-                    }
-
-                    let v = dense_nodes.keys_vals[tags_offset];
-                    tags_offset += 1;
-
-                    tags.serialize(string_refs[k as usize], string_refs[v as usize])?;
-                }
-            }
-        }
-        assert_eq!(tags_offset, dense_nodes.keys_vals.len());
-        stats.num_nodes += dense_nodes.id.len();
-    }
-    Ok(stats)
-}
-
-fn resolve_ways(
-    block: &osmpbf::PrimitiveBlock,
-    nodes_id_to_idx: &ids::IdTable,
-) -> (Vec<Option<u64>>, Stats) {
-    let mut result = Vec::new();
-    let mut stats = Stats::default();
-    for group in &block.primitivegroup {
-        for pbf_way in &group.ways {
-            let mut node_ref = 0;
-            for delta in &pbf_way.refs {
-                node_ref += delta;
-                let idx = nodes_id_to_idx.get(node_ref as u64);
-                stats.num_unresolved_node_ids += idx.is_none() as usize;
-
-                result.push(idx);
-            }
-        }
-    }
-    (result, stats)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn serialize_ways(
-    block: &osmpbf::PrimitiveBlock,
-    nodes_id_to_idx: &[Option<u64>],
-    ways: &mut flatdata::ExternalVector<osmflat::Way>,
-    way_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
-    ways_id_to_idx: &mut ids::IdTableBuilder,
-    stringtable: &mut StringTable,
-    tags: &mut TagSerializer,
-    nodes_index: &mut flatdata::ExternalVector<osmflat::NodeIndex>,
-) -> Result<Stats, Error> {
-    let mut stats = Stats::default();
-    let string_refs = add_string_table(&block.stringtable, stringtable)?;
-    let mut nodes_idx = nodes_id_to_idx.iter().cloned();
-    for group in &block.primitivegroup {
-        for pbf_way in &group.ways {
-            let index = ways_id_to_idx.insert(pbf_way.id as u64);
-            assert_eq!(index as usize, ways.len());
-
-            let way = ways.grow()?;
-            if let Some(ids) = way_ids {
-                ids.grow()?.set_value(pbf_way.id as u64);
-            }
-
-            debug_assert_eq!(pbf_way.keys.len(), pbf_way.vals.len(), "invalid input data");
-            way.set_tag_first_idx(tags.next_index());
-
-            for i in 0..pbf_way.keys.len() {
-                tags.serialize(
-                    string_refs[pbf_way.keys[i] as usize],
-                    string_refs[pbf_way.vals[i] as usize],
-                )?;
-            }
-
-            way.set_ref_first_idx(nodes_index.len() as u64);
-            for _ in &pbf_way.refs {
-                nodes_index.grow()?.set_value(nodes_idx.next().unwrap());
-            }
-        }
-        stats.num_ways += group.ways.len();
-    }
-    Ok(stats)
-}
-
-fn build_relations_index<I>(data: &[u8], block_index: I) -> Result<ids::IdTable, Error>
+fn build_relations_index<I>(
+    data: &[u8],
+    block_index: I,
+    db: &DB,
+) -> Result<(AHashMap<i64, RelationInfo>, Vec<RelationInfo>), Error>
 where
     I: ExactSizeIterator<Item = BlockIndex> + Send + 'static,
 {
-    let mut result = ids::IdTableBuilder::new();
+    let node_id_to_lat_lon_cf = db.cf_handle(NodeIdToLonLatTDC::NAME).unwrap();
+
+    let mut found = AHashMap::new();
+    let mut unresolved = vec![];
+
     let pb = ProgressBar::new(block_index.len() as u64)
         .with_style(pb_style())
         .with_prefix("Building relations index");
@@ -307,257 +206,351 @@ where
         |idx| read_block(data, &idx),
         |block: Result<osmpbf::PrimitiveBlock, _>| -> Result<(), Error> {
             for group in &block?.primitivegroup {
-                for relation in &group.relations {
-                    result.insert(relation.id as u64);
+                for pbf_relation in &group.relations {
+                    let mut relation_info = RelationInfo {
+                        id: pbf_relation.id,
+                        ..Default::default()
+                    };
+
+                    let mut memid = 0;
+                    for i in 0..pbf_relation.roles_sid.len() {
+                        memid += pbf_relation.memids[i];
+
+                        let member_type =
+                            osmpbf::relation::MemberType::try_from(pbf_relation.types[i]);
+                        assert!(member_type.is_ok());
+
+                        match member_type.unwrap() {
+                            osmpbf::relation::MemberType::Node => {
+                                let v = db
+                                    .get_cf(node_id_to_lat_lon_cf, memid.to_be_bytes())?
+                                    .map(break_node_lon_lat);
+
+                                // Relation points are stored as (lon, lat) to match the
+                                // way-member bbox corners pushed below. Missing members are
+                                // counted later, in the emit pass, with osmium semantics.
+                                if let Some((lon, lat)) = v {
+                                    relation_info.points.push((lon, lat));
+                                }
+                            }
+                            osmpbf::relation::MemberType::Way => {
+                                let v = <DB as RocksDBSync>::get::<WayIdToMbbTDC>(
+                                    db,
+                                    &OsmIdKey::new(memid),
+                                )?;
+
+                                if let Some(mbr) = v {
+                                    relation_info.points.push((mbr.mbb[0], mbr.mbb[1]));
+                                    relation_info.points.push((mbr.mbb[2], mbr.mbb[3]));
+                                }
+                            }
+                            osmpbf::relation::MemberType::Relation => {
+                                relation_info.relation_ids.insert(memid);
+                            }
+                        }
+                    }
+                    if relation_info.is_ready() {
+                        found.insert(pbf_relation.id, relation_info);
+                    } else {
+                        unresolved.push(relation_info)
+                    }
                 }
+                pb.inc(1);
             }
-            pb.inc(1);
             Ok(())
         },
     )?;
     pb.finish();
 
-    Ok(result.build())
+    Ok((found, unresolved))
+}
+
+fn resolve_all_relations(
+    mut found: AHashMap<i64, RelationInfo>,
+    unresolved: Vec<RelationInfo>,
+) -> AHashMap<i64, RelationInfo> {
+    let mut unresolved: VecDeque<RelationInfo> = unresolved.into();
+
+    // Pull member geometry from sub-relations in repeated passes until a full
+    // pass makes no progress (handles nesting; terminates on cycles/missing).
+    loop {
+        let mut progressed = false;
+        let mut remaining = VecDeque::with_capacity(unresolved.len());
+        while let Some(mut p) = unresolved.pop_front() {
+            for rel_id in p.relation_ids.clone() {
+                if let Some(f) = found.get(&rel_id) {
+                    p.points.extend(&f.points);
+                    p.relation_ids.remove(&rel_id);
+                    progressed = true;
+                }
+            }
+            if p.is_ready() {
+                found.insert(p.id, p);
+                progressed = true;
+            } else {
+                remaining.push_back(p);
+            }
+        }
+        unresolved = remaining;
+        if unresolved.is_empty() || !progressed {
+            break;
+        }
+    }
+
+    // Stop dropping: keep every relation that could not be fully resolved, with
+    // whatever member geometry it accumulated. Its unresolvable relation members
+    // are simply ignored (and counted as missing in the emit pass).
+    for p in unresolved {
+        found.entry(p.id).or_insert(p);
+    }
+    found
 }
 
 #[allow(clippy::too_many_arguments)]
 fn serialize_relations(
-    block: &osmpbf::PrimitiveBlock,
-    nodes_id_to_idx: &ids::IdTable,
-    ways_id_to_idx: &ids::IdTable,
-    relations_id_to_idx: &ids::IdTable,
-    stringtable: &mut StringTable,
+    pbf_relation: &osmpbf::Relation,
+    mbb: [i32; 4],
+    relation_id_to_idx: &AHashMap<i64, u64>,
+    db: &DB,
     relations: &mut flatdata::ExternalVector<osmflat::Relation>,
     relation_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
     relation_members: &mut flatdata::MultiVector<osmflat::RelationMembers>,
+    string_refs: Vec<u64>,
     tags: &mut TagSerializer,
+    missing: &mut MissingRefs,
 ) -> Result<Stats, Error> {
     let mut stats = Stats::default();
-    let string_refs = add_string_table(&block.stringtable, stringtable)?;
-    for group in &block.primitivegroup {
-        for pbf_relation in &group.relations {
-            let relation = relations.grow()?;
-            if let Some(ids) = relation_ids {
-                ids.grow()?.set_value(pbf_relation.id as u64);
-            }
 
-            debug_assert_eq!(
-                pbf_relation.keys.len(),
-                pbf_relation.vals.len(),
-                "invalid input data"
-            );
-            relation.set_tag_first_idx(tags.next_index());
-            for i in 0..pbf_relation.keys.len() {
-                tags.serialize(
-                    string_refs[pbf_relation.keys[i] as usize],
-                    string_refs[pbf_relation.vals[i] as usize],
-                )?;
-            }
+    let cf_node_id_to_idx = db.cf_handle(NodeIdToIdxTDC::NAME).unwrap();
+    let cf_way_id_to_idx = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
 
-            debug_assert!(
-                pbf_relation.roles_sid.len() == pbf_relation.memids.len()
-                    && pbf_relation.memids.len() == pbf_relation.types.len(),
-                "invalid input data"
-            );
+    debug_assert_eq!(
+        pbf_relation.keys.len(),
+        pbf_relation.vals.len(),
+        "invalid input data"
+    );
 
-            let mut memid = 0;
-            let mut members = relation_members.grow()?;
-            for i in 0..pbf_relation.roles_sid.len() {
-                memid += pbf_relation.memids[i];
+    let relation = relations.grow()?;
+    if let Some(ids) = relation_ids {
+        ids.grow()?.set_value(pbf_relation.id as u64);
+    }
 
-                let member_type = osmpbf::relation::MemberType::try_from(pbf_relation.types[i]);
-                debug_assert!(member_type.is_ok());
+    relation.set_tag_first_idx(tags.next_index());
+    relation.set_min_lon(mbb[0]);
+    relation.set_min_lat(mbb[1]);
+    relation.set_max_lon(mbb[2]);
+    relation.set_max_lat(mbb[3]);
+    for i in 0..pbf_relation.keys.len() {
+        tags.serialize(
+            string_refs[pbf_relation.keys[i] as usize],
+            string_refs[pbf_relation.vals[i] as usize],
+        )?;
+    }
 
-                match member_type.unwrap() {
-                    osmpbf::relation::MemberType::Node => {
-                        let idx = nodes_id_to_idx.get(memid as u64);
-                        stats.num_unresolved_node_ids = idx.is_none() as usize;
+    debug_assert!(
+        pbf_relation.roles_sid.len() == pbf_relation.memids.len()
+            && pbf_relation.memids.len() == pbf_relation.types.len(),
+        "invalid input data"
+    );
 
-                        let member = members.add_node_member();
-                        member.set_node_idx(idx);
-                        member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
-                    }
-                    osmpbf::relation::MemberType::Way => {
-                        let idx = ways_id_to_idx.get(memid as u64);
-                        stats.num_unresolved_way_ids = idx.is_none() as usize;
+    stats.num_relations = 1;
 
-                        let member = members.add_way_member();
-                        member.set_way_idx(idx);
-                        member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
-                    }
-                    osmpbf::relation::MemberType::Relation => {
-                        let idx = relations_id_to_idx.get(memid as u64);
-                        stats.num_unresolved_rel_ids = idx.is_none() as usize;
+    let mut memid = 0;
+    let mut members = relation_members.grow()?;
 
-                        let member = members.add_relation_member();
-                        member.set_relation_idx(idx);
-                        member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
-                    }
+    for i in 0..pbf_relation.roles_sid.len() {
+        memid += pbf_relation.memids[i];
+
+        let member_type = osmpbf::relation::MemberType::try_from(pbf_relation.types[i]);
+        debug_assert!(member_type.is_ok());
+
+        match member_type.unwrap() {
+            osmpbf::relation::MemberType::Node => {
+                let idx = db
+                    .get_cf(cf_node_id_to_idx, memid.to_be_bytes())?
+                    .map(|v| u64::from_be_bytes(v[0..8].try_into().unwrap()));
+                if idx.is_none() {
+                    missing.nodes_in_relations.insert(memid);
                 }
+
+                let member = members.add_node_member();
+                member.set_node_idx(idx);
+                member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
             }
-            stats.num_relations += 1;
+            osmpbf::relation::MemberType::Way => {
+                let idx = db
+                    .get_cf(cf_way_id_to_idx, memid.to_be_bytes())?
+                    .map(|v| u64::from_be_bytes(v[0..8].try_into().unwrap()));
+                if idx.is_none() {
+                    missing.ways_in_relations.insert(memid);
+                }
+
+                let member = members.add_way_member();
+                member.set_way_idx(idx);
+                member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
+            }
+            osmpbf::relation::MemberType::Relation => {
+                // Resolve the referenced relation to its index in the
+                // spatially-ordered relations vector. References to relations
+                // not in the archive become `None` (INVALID_IDX).
+                let idx = relation_id_to_idx.get(&memid).copied();
+                if idx.is_none() {
+                    missing.relations_in_relations.insert(memid);
+                }
+                let member = members.add_relation_member();
+                member.set_relation_idx(idx);
+                member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
+            }
         }
     }
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn serialize_dense_node_blocks(
-    builder: &osmflat::OsmBuilder,
-    granularity: i32,
-    mut node_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
-    blocks: Vec<BlockIndex>,
-    data: &[u8],
-    tags: &mut TagSerializer,
-    stringtable: &mut StringTable,
-    stats: &mut Stats,
-) -> Result<ids::IdTable, Error> {
-    let mut nodes_id_to_idx = ids::IdTableBuilder::new();
-    let mut nodes = builder.start_nodes()?;
-    let pb = ProgressBar::new(blocks.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Converting dense nodes");
-    parallel::parallel_process(
-        blocks.into_iter(),
-        |idx| read_block(data, &idx),
-        |block| -> Result<osmpbf::PrimitiveBlock, Error> {
-            let block = block?;
-            *stats += serialize_dense_nodes(
-                &block,
-                granularity,
-                &mut nodes,
-                &mut node_ids,
-                &mut nodes_id_to_idx,
-                stringtable,
-                tags,
-            )?;
-
-            pb.inc(1);
-            Ok(block)
-        },
-    )?;
-    pb.finish();
-
-    // fill tag_first_idx of the sentry, since it contains the end of the tag range
-    // of the last node
-    nodes.grow()?.set_tag_first_idx(tags.next_index());
-    nodes.close()?;
-    if let Some(ids) = node_ids {
-        ids.close()?;
-    }
-    info!("Dense nodes converted.");
-    info!("Building dense nodes index...");
-    let nodes_id_to_idx = nodes_id_to_idx.build();
-    info!("Dense nodes index built.");
-    Ok(nodes_id_to_idx)
+/// Minimum bounding box `[min_lon, min_lat, max_lon, max_lat]` of a relation's
+/// member points, scaled with `coord_scale`. Returns `None` when the relation
+/// has no resolvable member geometry.
+fn relation_mbb(points: &[(i32, i32)], coord_scale: i32) -> Option<[i32; 4]> {
+    let cs = coord_scale as f64;
+    let points: MultiPoint<f64> = points
+        .iter()
+        .map(|p| (p.0 as f64 / cs, p.1 as f64 / cs))
+        .collect::<Vec<_>>()
+        .into();
+    let r = points.bounding_rect()?;
+    Some([
+        (r.min().x * cs) as i32,
+        (r.min().y * cs) as i32,
+        (r.max().x * cs) as i32,
+        (r.max().y * cs) as i32,
+    ])
 }
 
-type PrimitiveBlockWithIds = (osmpbf::PrimitiveBlock, (Vec<Option<u64>>, Stats));
-
-#[allow(clippy::too_many_arguments)]
-fn serialize_way_blocks(
-    builder: &osmflat::OsmBuilder,
-    mut way_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
-    blocks: Vec<BlockIndex>,
-    data: &[u8],
-    nodes_id_to_idx: &ids::IdTable,
-    tags: &mut TagSerializer,
-    stringtable: &mut StringTable,
-    stats: &mut Stats,
-) -> Result<ids::IdTable, Error> {
-    let mut ways_id_to_idx = ids::IdTableBuilder::new();
-    let mut ways = builder.start_ways()?;
-    let pb = ProgressBar::new(blocks.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Converting ways");
-    let mut nodes_index = builder.start_nodes_index()?;
-    parallel::parallel_process(
-        blocks.into_iter(),
-        |idx| {
-            let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
-            let ids = resolve_ways(&block, nodes_id_to_idx);
-            Ok((block, ids))
-        },
-        |block: io::Result<PrimitiveBlockWithIds>| -> Result<osmpbf::PrimitiveBlock, Error> {
-            let (block, (ids, stats_resolve)) = block?;
-            *stats += stats_resolve;
-            *stats += serialize_ways(
-                &block,
-                &ids,
-                &mut ways,
-                &mut way_ids,
-                &mut ways_id_to_idx,
-                stringtable,
-                tags,
-                &mut nodes_index,
-            )?;
-            pb.inc(1);
-
-            Ok(block)
-        },
-    )?;
-
-    {
-        let sentinel = ways.grow()?;
-        sentinel.set_tag_first_idx(tags.next_index());
-        sentinel.set_ref_first_idx(nodes_index.len() as u64);
-    }
-    ways.close()?;
-    if let Some(ids) = way_ids {
-        ids.close()?;
-    }
-    nodes_index.close()?;
-
-    pb.finish();
-    info!("Ways converted.");
-    info!("Building ways index...");
-    let ways_id_to_idx = ways_id_to_idx.build();
-    info!("Way index built.");
-    Ok(ways_id_to_idx)
+/// Space-filling-curve index of a relation's bounding box. Computed from the
+/// scaled `mbb` (not the raw member points) so it is identical to what the
+/// query side recomputes from the stored bounding box.
+fn relation_spatial_index(curve: &XZ2SFC, mbb: [i32; 4], coord_scale: i32) -> u64 {
+    let cs = coord_scale as f64;
+    osmflat::bbox_index(
+        curve,
+        mbb[0] as f64 / cs,
+        mbb[1] as f64 / cs,
+        mbb[2] as f64 / cs,
+        mbb[3] as f64 / cs,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn serialize_relation_blocks(
     builder: &osmflat::OsmBuilder,
+    db: &DB,
     mut relation_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     blocks: Vec<BlockIndex>,
     data: &[u8],
-    nodes_id_to_idx: &ids::IdTable,
-    ways_id_to_idx: &ids::IdTable,
     tags: &mut TagSerializer,
     stringtable: &mut StringTable,
     stats: &mut Stats,
+    missing: &mut MissingRefs,
+    coord_scale: i32,
 ) -> Result<(), Error> {
     // We need to build the index of relation ids first, since relations can refer
     // again to relations.
-    let relations_id_to_idx = build_relations_index(data, blocks.clone().into_iter())?;
+    let (found, unresolved) = build_relations_index(data, blocks.clone().into_iter(), db)?;
+    let found = resolve_all_relations(found, unresolved);
 
-    let mut relations = builder.start_relations()?;
-    let mut relation_members = builder.start_relation_members()?;
+    let relations_cf = db.cf_handle(RELATIONS).unwrap();
+    let relations_string_refs = db.cf_handle(RELATIONS_STRING_REFS).unwrap();
+
+    let curve = osmflat::way_curve();
 
     let pb = ProgressBar::new(blocks.len() as u64)
         .with_style(pb_style())
         .with_prefix("Converting relations");
-    parallel::parallel_process(
-        blocks.into_iter(),
-        |idx| read_block(data, &idx),
-        |block| -> Result<osmpbf::PrimitiveBlock, Error> {
-            let block = block?;
-            *stats += serialize_relations(
-                &block,
-                nodes_id_to_idx,
-                ways_id_to_idx,
-                &relations_id_to_idx,
-                stringtable,
-                &mut relations,
-                &mut relation_ids,
-                &mut relation_members,
-                tags,
+
+    // Store every relation, keyed by its spatial index, so iterating the column
+    // family yields spatial order. Relations with no resolvable member geometry
+    // get the `RELATION_NO_BBOX` sentinel and a `u64::MAX` key so they sort last
+    // and are never matched spatially (but are still emitted).
+    for v in blocks
+        .into_iter()
+        .map(|idx| read_block::<PrimitiveBlock>(data, &idx))
+    {
+        let block = v?;
+
+        let string_refs = add_string_table(&block.stringtable, stringtable)?;
+
+        pb.inc(1);
+
+        for rel in block.primitivegroup.into_iter().flat_map(|g| g.relations) {
+            let id = rel.id;
+            let mbb = found
+                .get(&id)
+                .and_then(|info| relation_mbb(&info.points, coord_scale));
+            let spatial_index = match mbb {
+                Some(mbb) => relation_spatial_index(&curve, mbb, coord_scale),
+                None => u64::MAX,
+            };
+            let key = OsmKey::new(spatial_index, id).serialize();
+            db.put_cf(relations_cf, &key, rel.encode_to_vec())?;
+            db.put_cf(
+                relations_string_refs,
+                &key,
+                create_relation_values(string_refs.as_slice()),
             )?;
-            pb.inc(1);
-            Ok(block)
-        },
-    )?;
+        }
+    }
+    pb.finish();
+
+    // First pass over the spatially-ordered relations: map each relation id to
+    // its final index, so relation members can be resolved in the second pass
+    // (a relation may reference another relation that sorts after it).
+    let mut relation_id_to_idx: AHashMap<i64, u64> = AHashMap::new();
+    for (idx, res) in db
+        .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
+        .enumerate()
+    {
+        let (key, _) = res?;
+        relation_id_to_idx.insert(OsmKey::from(key).id, idx as u64);
+    }
+
+    let mut relations = builder.start_relations()?;
+    let mut relation_members = builder.start_relation_members()?;
+
+    let pb = ProgressBar::new(relation_id_to_idx.len() as u64)
+        .with_style(pb_style())
+        .with_prefix("Ordering relations");
+
+    // Second pass: write the relations in spatial order, resolving members.
+    for res in db
+        .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
+        .zip(db.iterator_cf(relations_string_refs, rocksdb::IteratorMode::Start))
+    {
+        let (key, rel) = res.0?;
+        let (_, string_refs) = res.1?;
+
+        let id = OsmKey::from(key).id;
+        let relation = osmpbf::Relation::decode(rel.to_vec().as_slice())?;
+        let string_refs = break_relation_values(&string_refs);
+
+        // Relations without resolvable member geometry carry the sentinel bbox.
+        let mbb = found
+            .get(&id)
+            .and_then(|info| relation_mbb(&info.points, coord_scale))
+            .unwrap_or(osmflat::RELATION_NO_BBOX);
+
+        *stats += serialize_relations(
+            &relation,
+            mbb,
+            &relation_id_to_idx,
+            db,
+            &mut relations,
+            &mut relation_ids,
+            &mut relation_members,
+            string_refs,
+            tags,
+            missing,
+        )?;
+        pb.inc(1);
+    }
 
     {
         let sentinel = relations.grow()?;
@@ -650,7 +643,14 @@ fn run(args: args::Args) -> Result<(), Error> {
     serialize_header(&pbf_header, coord_scale, &builder, &mut stringtable)?;
     info!("Header written.");
 
+    // Keep `_scratch` alive for the whole conversion; dropping it removes the
+    // temporary RocksDB directory. `db` (declared here) is dropped before
+    // `_scratch`, closing the database before its files are deleted.
+    let scratch_parent = args.output.parent().unwrap_or_else(|| Path::new("."));
+    let (db, _scratch) = create_db(scratch_parent)?;
+
     let mut stats = Stats::default();
+    let mut missing = MissingRefs::default();
 
     let ids_archive;
     let mut node_ids = None;
@@ -663,38 +663,43 @@ fn run(args: args::Args) -> Result<(), Error> {
         relation_ids = Some(ids_archive.start_relations()?);
     }
 
-    let nodes_id_to_idx = serialize_dense_node_blocks(
+    serialize_dense_node_blocks(
         &builder,
         greatest_common_granularity,
         node_ids,
+        &db,
         pbf_dense_nodes,
         &input_data,
         &mut tags,
         &mut stringtable,
         &mut stats,
+        coord_scale,
     )?;
 
-    let ways_id_to_idx = serialize_way_blocks(
+    serialize_way_blocks(
         &builder,
+        &db,
         way_ids,
         pbf_ways,
         &input_data,
-        &nodes_id_to_idx,
         &mut tags,
         &mut stringtable,
         &mut stats,
+        &mut missing,
+        coord_scale,
     )?;
 
     serialize_relation_blocks(
         &builder,
+        &db,
         relation_ids,
         pbf_relations,
         &input_data,
-        &nodes_id_to_idx,
-        &ways_id_to_idx,
         &mut tags,
         &mut stringtable,
         &mut stats,
+        &mut missing,
+        coord_scale,
     )?;
 
     // Finalize data structures
@@ -711,6 +716,7 @@ fn run(args: args::Args) -> Result<(), Error> {
     info!("verified that osmflat archive can be opened.");
 
     println!("{stats}");
+    println!("{missing}");
     Ok(())
 }
 
