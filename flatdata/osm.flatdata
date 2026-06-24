@@ -173,6 +173,19 @@ struct Relation {
      */
     @range(tags)
     tag_first_idx: u64 : 40;
+    /**
+     * Minimum bounding box of the relation's members (min longitude scaled with `header.coord_scale`).
+     *
+     * Relations are stored ordered by a space-filling-curve index of this bounding box, so spatial
+     * queries do not need to re-resolve members.
+     */
+    min_lon: i32 : 32;
+    /// Bounding box of the relation's members (min latitude scaled with `header.coord_scale`).
+    min_lat: i32 : 32;
+    /// Bounding box of the relation's members (max longitude scaled with `header.coord_scale`).
+    max_lon: i32 : 32;
+    /// Bounding box of the relation's members (max latitude scaled with `header.coord_scale`).
+    max_lat: i32 : 32;
 }
 
 struct Id {
