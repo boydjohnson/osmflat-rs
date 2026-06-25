@@ -1,7 +1,6 @@
 mod args;
 mod error;
 mod osmpbf;
-mod parallel;
 mod processing;
 mod stats;
 mod storage;
@@ -24,8 +23,12 @@ use processing::Key;
 use processing::RocksDBSync;
 use processing::{RELATIONS, RELATIONS_STRING_REFS};
 use prost::Message;
+use rayon::iter::ParallelBridge;
+use rayon::iter::ParallelIterator;
 use space_time::xzorder::xz2_sfc::XZ2SFC;
-use storage::{break_node_lon_lat, break_relation_values, create_relation_values, RelationInfo};
+use storage::{break_relation_values, create_relation_values, RelationInfo};
+
+use crate::error::OsmFlatcError;
 
 use clap::Parser;
 use flatdata::FileResourceStorage;
@@ -176,7 +179,7 @@ impl<'a> TagSerializer<'a> {
 fn add_string_table(
     pbf_stringtable: &osmpbf::StringTable,
     stringtable: &mut StringTable,
-) -> Result<Vec<u64>, Error> {
+) -> Result<Vec<u64>, OsmFlatcError> {
     let mut result = Vec::with_capacity(pbf_stringtable.s.len());
     for x in &pbf_stringtable.s {
         let string = str::from_utf8(x)?;
@@ -193,74 +196,90 @@ fn build_relations_index<I>(
 where
     I: ExactSizeIterator<Item = BlockIndex> + Send + 'static,
 {
-    let node_id_to_lat_lon_cf = db.cf_handle(NodeIdToLonLatTDC::NAME).unwrap();
-
-    let mut found = AHashMap::new();
-    let mut unresolved = vec![];
-
     let pb = ProgressBar::new(block_index.len() as u64)
         .with_style(pb_style())
         .with_prefix("Building relations index");
-    parallel::parallel_process(
-        block_index,
-        |idx| read_block(data, &idx),
-        |block: Result<osmpbf::PrimitiveBlock, _>| -> Result<(), Error> {
-            for group in &block?.primitivegroup {
-                for pbf_relation in &group.relations {
-                    let mut relation_info = RelationInfo {
-                        id: pbf_relation.id,
-                        ..Default::default()
-                    };
 
-                    let mut memid = 0;
-                    for i in 0..pbf_relation.roles_sid.len() {
-                        memid += pbf_relation.memids[i];
+    // The per-member RocksDB lookups dominate this pass and are random reads
+    // against a planet-sized DB, so fan them out across all Rayon workers and
+    // merge the per-block results with `try_reduce`. Order is irrelevant here:
+    // `found` is keyed by id and `unresolved` is processed without regard to
+    // order. `par_bridge` drives the (non-indexed) block iterator in parallel.
+    let (found_list, unresolved) = block_index
+        .par_bridge()
+        .map(
+            |idx| -> Result<(Vec<RelationInfo>, Vec<RelationInfo>), OsmFlatcError> {
+                let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
+                let mut block_found = Vec::new();
+                let mut block_unresolved = Vec::new();
+                for group in &block.primitivegroup {
+                    for pbf_relation in &group.relations {
+                        let mut relation_info = RelationInfo {
+                            id: pbf_relation.id,
+                            ..Default::default()
+                        };
 
-                        let member_type =
-                            osmpbf::relation::MemberType::try_from(pbf_relation.types[i]);
-                        assert!(member_type.is_ok());
+                        let mut memid = 0;
+                        for i in 0..pbf_relation.roles_sid.len() {
+                            memid += pbf_relation.memids[i];
 
-                        match member_type.unwrap() {
-                            osmpbf::relation::MemberType::Node => {
-                                let v = db
-                                    .get_cf(node_id_to_lat_lon_cf, memid.to_be_bytes())?
-                                    .map(break_node_lon_lat);
+                            let member_type =
+                                osmpbf::relation::MemberType::try_from(pbf_relation.types[i]);
+                            assert!(member_type.is_ok());
 
-                                // Relation points are stored as (lon, lat) to match the
-                                // way-member bbox corners pushed below. Missing members are
-                                // counted later, in the emit pass, with osmium semantics.
-                                if let Some((lon, lat)) = v {
-                                    relation_info.points.push((lon, lat));
+                            match member_type.unwrap() {
+                                osmpbf::relation::MemberType::Node => {
+                                    let v = <DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(
+                                        db,
+                                        &OsmIdKey::new(memid),
+                                    )?;
+
+                                    // Relation points are stored as (lon, lat) to match the
+                                    // way-member bbox corners pushed below. Missing members are
+                                    // counted later, in the emit pass, with osmium semantics.
+                                    if let Some(v) = v {
+                                        relation_info.points.push((v.lon, v.lat));
+                                    }
                                 }
-                            }
-                            osmpbf::relation::MemberType::Way => {
-                                let v = <DB as RocksDBSync>::get::<WayIdToMbbTDC>(
-                                    db,
-                                    &OsmIdKey::new(memid),
-                                )?;
+                                osmpbf::relation::MemberType::Way => {
+                                    let v = <DB as RocksDBSync>::get::<WayIdToMbbTDC>(
+                                        db,
+                                        &OsmIdKey::new(memid),
+                                    )?;
 
-                                if let Some(mbr) = v {
-                                    relation_info.points.push((mbr.mbb[0], mbr.mbb[1]));
-                                    relation_info.points.push((mbr.mbb[2], mbr.mbb[3]));
+                                    if let Some(mbr) = v {
+                                        relation_info.points.push((mbr.mbb[0], mbr.mbb[1]));
+                                        relation_info.points.push((mbr.mbb[2], mbr.mbb[3]));
+                                    }
                                 }
-                            }
-                            osmpbf::relation::MemberType::Relation => {
-                                relation_info.relation_ids.insert(memid);
+                                osmpbf::relation::MemberType::Relation => {
+                                    relation_info.relation_ids.insert(memid);
+                                }
                             }
                         }
-                    }
-                    if relation_info.is_ready() {
-                        found.insert(pbf_relation.id, relation_info);
-                    } else {
-                        unresolved.push(relation_info)
+                        if relation_info.is_ready() {
+                            block_found.push(relation_info);
+                        } else {
+                            block_unresolved.push(relation_info);
+                        }
                     }
                 }
                 pb.inc(1);
-            }
-            Ok(())
-        },
-    )?;
+                Ok((block_found, block_unresolved))
+            },
+        )
+        .try_reduce(
+            || (Vec::new(), Vec::new()),
+            |mut acc, (mut block_found, mut block_unresolved)| {
+                acc.0.append(&mut block_found);
+                acc.1.append(&mut block_unresolved);
+                Ok(acc)
+            },
+        )?;
     pb.finish();
+
+    let mut found = AHashMap::new();
+    found.extend(found_list.into_iter().map(|info| (info.id, info)));
 
     Ok((found, unresolved))
 }
@@ -582,6 +601,16 @@ fn run(args: args::Args) -> Result<(), Error> {
     let input_file = File::open(&args.input)?;
     let input_data = unsafe { Mmap::map(&input_file)? };
 
+    // Each conversion phase scans the pbf front-to-back (blocks are read in file
+    // order), so hint the kernel for sequential access: more aggressive
+    // readahead plus drop-behind of already-read pages, which improves
+    // throughput and keeps the page cache from competing with the RocksDB block
+    // cache and memtables. Best-effort -- a failure (e.g. unsupported platform)
+    // is not fatal.
+    if let Err(e) = input_data.advise(memmap2::Advice::Sequential) {
+        log::warn!("madvise(MADV_SEQUENTIAL) on input failed, continuing: {e}");
+    }
+
     let storage = FileResourceStorage::new(args.output.clone());
     let builder = osmflat::OsmBuilder::new(storage.clone())?;
 
@@ -646,8 +675,29 @@ fn run(args: args::Args) -> Result<(), Error> {
     // Keep `_scratch` alive for the whole conversion; dropping it removes the
     // temporary RocksDB directory. `db` (declared here) is dropped before
     // `_scratch`, closing the database before its files are deleted.
-    let scratch_parent = args.output.parent().unwrap_or_else(|| Path::new("."));
-    let (db, _scratch) = create_db(scratch_parent)?;
+    //
+    // The scratch DB is I/O-heavy and huge for a planet, so honor an explicit
+    // `--scratch-dir` (point it at a fast SSD) and otherwise fall back to the
+    // output's parent directory.
+    let scratch_parent = args
+        .scratch_dir
+        .as_deref()
+        .unwrap_or_else(|| args.output.parent().unwrap_or_else(|| Path::new(".")));
+
+    // Bound RocksDB's open SST handles to the available fd budget. Reserve
+    // headroom for the input mmap, the flatdata output vectors, RocksDB's own
+    // metadata files and stdio; cap so RocksDB never hogs the whole budget on a
+    // machine with a very high limit.
+    let fd_limit = raise_open_file_limit();
+    let max_open_files = fd_limit.saturating_sub(256).clamp(64, 8192) as i32;
+    info!("Open-file limit: {fd_limit}, RocksDB max_open_files: {max_open_files}");
+
+    let (db, _scratch) = create_db(
+        scratch_parent,
+        args.block_cache_mb * 1024 * 1024,
+        args.write_buffer_mb * 1024 * 1024,
+        max_open_files,
+    )?;
 
     let mut stats = Stats::default();
     let mut missing = MissingRefs::default();
@@ -720,8 +770,48 @@ fn run(args: args::Args) -> Result<(), Error> {
     Ok(())
 }
 
+/// Raise the soft open-file limit toward the hard limit and return the
+/// resulting soft limit. The scratch RocksDB keeps an fd open per SST file, so
+/// a large ingest needs far more than the default soft limit (256 on macOS).
+///
+/// Best-effort: on any failure the current soft limit is returned unchanged.
+/// On macOS the hard limit is reported as "unlimited" but `setrlimit` rejects
+/// anything above `kern.maxfilesperproc`, so probe a few sane targets from high
+/// to low rather than asking for the hard limit directly.
+#[cfg(unix)]
+fn raise_open_file_limit() -> u64 {
+    // SAFETY: plain libc rlimit syscalls on a zeroed POD struct.
+    unsafe {
+        let mut rlim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            return 256;
+        }
+        let hard = rlim.rlim_max as u64;
+        for target in [65536u64, 24576, 10240] {
+            let want = target.min(hard);
+            if want <= rlim.rlim_cur as u64 {
+                break;
+            }
+            let new = libc::rlimit {
+                rlim_cur: want as libc::rlim_t,
+                rlim_max: rlim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                rlim.rlim_cur = want as libc::rlim_t;
+                break;
+            }
+        }
+        rlim.rlim_cur as u64
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() -> u64 {
+    256
+}
+
 fn pb_style() -> ProgressStyle {
-    ProgressStyle::with_template("{prefix:>24} [{bar:23}] {pos}/{len}: {per_sec} {elapsed}")
+    ProgressStyle::with_template("{prefix:>24} [{bar:23}] {pos}/{len}: {per_sec} {elapsed}/{eta}")
         .unwrap()
         .progress_chars("=> ")
 }

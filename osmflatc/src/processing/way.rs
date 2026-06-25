@@ -1,10 +1,9 @@
-use std::io;
-
-use super::WriteBatchInternal;
+use super::{write_batch_no_wal, WriteBatchInternal};
+use crate::error::OsmFlatcError;
 use crate::{
     add_string_table,
-    osmpbf::{self, read_block, BlockIndex, PrimitiveBlock},
-    parallel, pb_style,
+    osmpbf::{self, read_block, BlockIndex},
+    pb_style,
     processing::{
         node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC},
         storage::{OsmIdKey, OsmIdxValue, OsmKey},
@@ -17,23 +16,36 @@ use crate::{
 use geo::{BoundingRect, MultiPoint};
 use indicatif::ProgressBar;
 use log::info;
+use parking_lot::Mutex;
+use rayon::prelude::*;
 use rocksdb::DB;
 use storage::{WayIdToIdxTDC, WayIdToMbbTDC, WayMbbValue, WayTDC, WayValue};
 
 pub(crate) mod storage;
 
+/// Number of ways resolved per parallel batch in the ordering pass. Large
+/// enough to keep the Rayon pool busy and amortize the sequential write of each
+/// chunk; small enough that the buffered ways and their resolved indices stay a
+/// modest fraction of memory.
+const ORDER_CHUNK: usize = 100_000;
+
 fn serialize_ways(
     block: &osmpbf::PrimitiveBlock,
     batch: &mut impl RocksDBUnsync,
     db: &DB,
-    stringtable: &mut StringTable,
+    stringtable: &Mutex<StringTable>,
     coord_scale: i32,
-) -> Result<Stats, Error> {
+) -> Result<Stats, OsmFlatcError> {
     let mut stats = Stats::default();
 
     let curve = osmflat::way_curve();
 
-    let string_refs = add_string_table(&block.stringtable, stringtable)?;
+    // Shared across the worker threads; hold the lock only for the per-block
+    // string interning, not the per-way serialization below.
+    let string_refs = {
+        let mut guard = stringtable.lock();
+        add_string_table(&block.stringtable, &mut guard)?
+    };
 
     for group in &block.primitivegroup {
         for pbf_way in &group.ways {
@@ -119,14 +131,19 @@ pub fn serialize_way_blocks(
         .with_style(pb_style())
         .with_prefix("Converting ways");
     let mut nodes_index = builder.start_nodes_index()?;
-    parallel::parallel_process(
-        blocks.into_iter(),
-        |idx| {
+
+    // The per-member RocksDB node-location lookups dominate this pass, so fan it
+    // out across all Rayon workers rather than running on a single consumer. The
+    // string table is shared behind a Mutex (locked once per block) and the
+    // per-block `stats` are commutative, merged with `try_reduce`. Order is
+    // irrelevant: ways are emitted later by iterating RocksDB in sorted key
+    // order. `std::mem::take` moves the caller's table in for the duration and
+    // it is restored below.
+    let string_table = Mutex::new(std::mem::take(stringtable));
+    let total = blocks
+        .into_par_iter()
+        .map(|idx| -> Result<Stats, OsmFlatcError> {
             let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
-            Ok(block)
-        },
-        |block: io::Result<PrimitiveBlock>| -> Result<osmpbf::PrimitiveBlock, Error> {
-            let block = block?;
 
             let mut batch = WriteBatchInternal::default();
             for cf_name in [WayTDC::NAME, WayIdToMbbTDC::NAME] {
@@ -134,15 +151,20 @@ pub fn serialize_way_blocks(
                 batch.insert_cf(cf_name, cf);
             }
 
-            *stats += serialize_ways(&block, &mut batch, db, stringtable, coord_scale)?;
+            let block_stats = serialize_ways(&block, &mut batch, db, &string_table, coord_scale)?;
 
-            db.write(batch.inner())?;
+            write_batch_no_wal(db, batch.inner())?;
 
             pb.inc(1);
 
-            Ok(block)
-        },
-    )?;
+            Ok(block_stats)
+        })
+        .try_reduce(Stats::default, |mut a, b| {
+            a += b;
+            Ok(a)
+        })?;
+    *stats += total;
+    *stringtable = string_table.into_inner();
 
     pb.finish();
     info!("Ways converted.");
@@ -155,49 +177,81 @@ pub fn serialize_way_blocks(
         .with_style(pb_style())
         .with_prefix("Ordering ways by spatial index order");
 
-    for (i, r) in <DB as RocksDB>::iterator::<WayTDC>(db)?.enumerate() {
-        let (k, v) = r?;
-
-        let way = ways.grow()?;
-
-        let tag_first_idx = tags.next_index();
-
-        for &(k, v) in &v.key_vals {
-            tags.serialize(k, v)?;
+    // The per-ref `NodeIdToIdx` lookups are random reads against the big node CF
+    // and dominate this pass, but the flatdata writes (`ways`, `nodes_index`,
+    // tag index) must stay in spatial-iteration order. So pull a chunk of ways
+    // out of the (sequential) RocksDB iterator, resolve every chunk's node refs
+    // to their final indices in parallel -- `par_iter().collect()` preserves
+    // order -- then write the resolved chunk sequentially. The random reads fan
+    // out across all Rayon workers; only the cheap, ordered appends run serially.
+    let mut base: usize = 0;
+    let mut iter = <DB as RocksDB>::iterator::<WayTDC>(db)?;
+    loop {
+        let mut chunk: Vec<(i64, WayValue)> = Vec::with_capacity(ORDER_CHUNK);
+        for r in iter.by_ref().take(ORDER_CHUNK) {
+            let (k, v) = r?;
+            chunk.push((k.id, v));
+        }
+        if chunk.is_empty() {
+            break;
         }
 
-        way.set_tag_first_idx(tag_first_idx);
-        way.set_ref_first_idx(nodes_index.len() as u64);
+        // Parallel: resolve each way's node-id refs to final indices.
+        let resolved: Vec<Vec<Option<u64>>> = chunk
+            .par_iter()
+            .map(|(_, v)| -> Result<Vec<Option<u64>>, OsmFlatcError> {
+                v.node_refs
+                    .iter()
+                    .map(|&n| {
+                        Ok(
+                            <DB as RocksDBSync>::get::<NodeIdToIdxTDC>(db, &OsmIdKey::new(n))?
+                                .map(|v| v.idx),
+                        )
+                    })
+                    .collect()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let idx = i as u64;
+        // Sequential: write the chunk in spatial-iteration order.
+        for (j, ((way_id, v), resolved_refs)) in chunk.iter().zip(resolved).enumerate() {
+            let way = ways.grow()?;
 
-        batch.put::<WayIdToIdxTDC>(OsmIdKey::new(k.id), OsmIdxValue::new(idx));
-
-        for n in v.node_refs {
-            let idx =
-                <DB as RocksDBSync>::get::<NodeIdToIdxTDC>(db, &OsmIdKey::new(n))?.map(|v| v.idx);
-            if idx.is_none() {
-                // A node referenced by a way but absent from the archive.
-                missing.nodes_in_ways.insert(n);
+            let tag_first_idx = tags.next_index();
+            for &(k, v) in &v.key_vals {
+                tags.serialize(k, v)?;
             }
-            nodes_index.grow()?.set_value(idx);
+
+            way.set_tag_first_idx(tag_first_idx);
+            way.set_ref_first_idx(nodes_index.len() as u64);
+
+            batch.put::<WayIdToIdxTDC>(OsmIdKey::new(*way_id), OsmIdxValue::new((base + j) as u64));
+
+            for (&n, resolved_idx) in v.node_refs.iter().zip(resolved_refs) {
+                if resolved_idx.is_none() {
+                    // A node referenced by a way but absent from the archive.
+                    missing.nodes_in_ways.insert(n);
+                }
+                nodes_index.grow()?.set_value(resolved_idx);
+            }
+
+            if let Some(ids) = &mut way_ids {
+                ids.grow()?.set_value(*way_id as u64);
+            }
+
+            pb.inc(1);
+
+            if j % BATCH_SIZE == 0 {
+                write_batch_no_wal(db, batch.inner())?;
+                batch = WriteBatchInternal::default();
+                let cf = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
+                batch.insert_cf(WayIdToIdxTDC::NAME, cf);
+            }
         }
 
-        if let Some(ids) = &mut way_ids {
-            ids.grow()?.set_value(k.id as u64);
-        }
-
-        pb.inc(1);
-
-        if i % BATCH_SIZE == 0 {
-            db.write(batch.inner())?;
-            batch = WriteBatchInternal::default();
-            let cf = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
-            batch.insert_cf(WayIdToIdxTDC::NAME, cf);
-        }
+        base += chunk.len();
     }
 
-    db.write(batch.inner())?;
+    write_batch_no_wal(db, batch.inner())?;
 
     pb.finish();
 

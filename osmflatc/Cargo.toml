@@ -18,11 +18,11 @@ edition = "2021"
 byteorder = "1.4.3"
 bytes = "1.4.0"
 clap = { version = "4.1.4", features = ["derive"] }
-crossbeam = "0.8.2"
 env_logger = "0.11.0"
 flatdata = "0.5.3"
 flate2 = "1.0.25"
 itertools = "0.13.0"
+libc = "0.2"
 log = "0.4.17"
 memmap2 = "0.9.0"
 osmflat = "0.3.0"
@@ -30,7 +30,7 @@ parking_lot = "0.12.1"
 prost = "0.13.2"
 prost-derive = "0.13.2"
 prost-types = "0.13.2"
-rayon = "1.6.1"
+rayon = "1.12.0"
 ahash = "0.8.3"
 indicatif = "0.17.3"
 space-time = "0.5.0"
@@ -38,7 +38,7 @@ geo = "0.28.0"
 rocksdb = { version = "0.22.0", default-features = false, features = [
     "snappy",
 ] }
-thiserror = "1.0.63"
+thiserror = "2.0.18"
 tempfile = "3.10.0"
 
 [build-dependencies]

@@ -62,6 +62,14 @@ pub struct StringTable {
     size_in_bytes: u64,
 }
 
+// Safety: a `StringTable` owns the byte buffers that its internal
+// `TerminatedStringPtr` keys point into (held in `data`), and those buffers are
+// never reallocated or freed while the table is alive (see `insert`). Moving
+// the whole table to another thread therefore keeps every pointer valid. It is
+// deliberately NOT `Sync`: concurrent mutation would race, so shared access
+// across threads must go through a `Mutex`.
+unsafe impl Send for StringTable {}
+
 impl StringTable {
     pub fn new() -> Self {
         Default::default()

@@ -1,14 +1,5 @@
 use std::collections::BTreeSet;
 
-/// Decode a `NodeLonLatValue` (serialized as lon then lat) into `(lon, lat)`.
-pub fn break_node_lon_lat(bytes: Vec<u8>) -> (i32, i32) {
-    assert!(bytes.len() == 8, "Value bytes were unexpected length");
-
-    let lon = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
-    let lat = i32::from_be_bytes(bytes[4..8].try_into().unwrap());
-    (lon, lat)
-}
-
 pub fn create_relation_values(string_refs: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 * string_refs.len());
     for s in string_refs {

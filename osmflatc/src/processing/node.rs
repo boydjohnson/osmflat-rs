@@ -1,17 +1,22 @@
+use crate::error::OsmFlatcError;
 use crate::processing::storage::OsmIdKey;
 use crate::processing::storage::OsmIdxValue;
 use crate::processing::storage::OsmKey;
-use crate::processing::{RocksDB, RocksDBSync, RocksDBUnsync, TempDataCodec, WriteBatchInternal};
+use crate::processing::{
+    write_batch_no_wal, RocksDB, RocksDBUnsync, TempDataCodec, WriteBatchInternal,
+};
 use crate::{
     add_string_table,
     osmpbf::{self, read_block, BlockIndex},
-    parallel, pb_style,
+    pb_style,
     stats::Stats,
     strings::StringTable,
     Error, TagSerializer, BATCH_SIZE,
 };
 use indicatif::ProgressBar;
 use log::info;
+use parking_lot::Mutex;
+use rayon::prelude::*;
 use rocksdb::DB;
 use storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodeLonLatValue, NodeValue, NodesTDC};
 
@@ -21,11 +26,18 @@ fn serialize_dense_nodes_primative_block(
     block: &osmpbf::PrimitiveBlock,
     granularity: i32,
     batch: &mut impl RocksDBUnsync,
-    stringtable: &mut StringTable,
+    string_table: &Mutex<StringTable>,
     coord_scale: i32,
-) -> Result<Stats, Error> {
+) -> Result<Stats, OsmFlatcError> {
     let mut stats = Stats::default();
-    let string_refs = add_string_table(&block.stringtable, stringtable)?;
+    // The global string table is shared across the worker threads. Hold the
+    // lock only for this per-block insertion (not the per-node loop below), so
+    // the expensive serialization parallelizes while string interning stays
+    // consistent.
+    let string_refs = {
+        let mut guard = string_table.lock();
+        add_string_table(&block.stringtable, &mut guard)?
+    };
 
     let curve = osmflat::node_curve();
 
@@ -75,7 +87,7 @@ fn serialize_dense_nodes_primative_block(
                 lat_ as f64 / coord_scale as f64,
             );
             let key = OsmKey::new(spatial_index, id);
-            let value = NodeValue::new(key_refs);
+            let value = NodeValue::new(lon_, lat_, key_refs);
 
             batch.put::<NodesTDC>(key, value);
 
@@ -107,11 +119,19 @@ pub fn serialize_dense_node_blocks(
     let pb = ProgressBar::new(blocks.len() as u64)
         .with_style(pb_style())
         .with_prefix("Converting dense nodes");
-    parallel::parallel_process(
-        blocks.into_iter(),
-        |idx| read_block(data, &idx),
-        |block| -> Result<osmpbf::PrimitiveBlock, Error> {
-            let block = block?;
+
+    // Serialization (spatial-curve indexing + value encoding + the RocksDB
+    // writes) dominates this pass, so fan it out across all Rayon workers. The
+    // only cross-block shared state is the string table -- behind a Mutex locked
+    // once per block -- and per-block `stats`, which are commutative and merged
+    // with `try_reduce`. Block order is irrelevant: the spatial ordering is
+    // recovered later by iterating RocksDB in sorted key order. `std::mem::take`
+    // moves the caller's table in for the duration and it is restored below.
+    let string_table = Mutex::new(std::mem::take(stringtable));
+    let total = blocks
+        .into_par_iter()
+        .map(|idx| -> Result<Stats, OsmFlatcError> {
+            let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
             let mut batch = WriteBatchInternal::default();
 
             for cf in [NodesTDC::NAME, NodeIdToLonLatTDC::NAME] {
@@ -120,18 +140,23 @@ pub fn serialize_dense_node_blocks(
                 }
             }
 
-            *stats += serialize_dense_nodes_primative_block(
+            let block_stats = serialize_dense_nodes_primative_block(
                 &block,
                 granularity,
                 &mut batch,
-                stringtable,
+                &string_table,
                 coord_scale,
             )?;
-            db.write(batch.inner())?;
+            write_batch_no_wal(db, batch.inner())?;
             pb.inc(1);
-            Ok(block)
-        },
-    )?;
+            Ok(block_stats)
+        })
+        .try_reduce(Stats::default, |mut a, b| {
+            a += b;
+            Ok(a)
+        })?;
+    *stats += total;
+    *stringtable = string_table.into_inner();
     pb.finish();
 
     let pb = ProgressBar::new(stats.num_nodes as u64)
@@ -150,10 +175,11 @@ pub fn serialize_dense_node_blocks(
 
         let node_id = OsmIdKey::new(k.id);
         let node = nodes.grow()?;
-        if let Some(n) = <DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(db, &node_id)? {
-            node.set_lat(n.lat);
-            node.set_lon(n.lon);
-        }
+        // Coordinates travel inline in the NodesTDC value, so the previous
+        // per-node random `NodeIdToLonLat` lookup is gone -- this is now a pure
+        // sequential scan.
+        node.set_lon(v.lon);
+        node.set_lat(v.lat);
 
         node.set_tag_first_idx(tags.next_index());
 
@@ -173,14 +199,14 @@ pub fn serialize_dense_node_blocks(
         pb.inc(1);
 
         if i % BATCH_SIZE == 0 {
-            db.write(batch.inner())?;
+            write_batch_no_wal(db, batch.inner())?;
             batch = WriteBatchInternal::default();
             let cf = db.cf_handle(NodeIdToIdxTDC::NAME).unwrap();
             batch.insert_cf(NodeIdToIdxTDC::NAME, cf);
         }
     }
 
-    db.write(batch.inner())?;
+    write_batch_no_wal(db, batch.inner())?;
     pb.finish();
 
     // fill tag_first_idx of the sentry, since it contains the end of the tag range
@@ -201,6 +227,7 @@ mod tests {
         processing::{mock::MockRocksBatch, node::storage::NodesTDC, storage::OsmKey, RocksDB},
         strings::StringTable,
     };
+    use parking_lot::Mutex;
 
     use super::serialize_dense_nodes_primative_block;
 
@@ -213,15 +240,10 @@ mod tests {
     fn assert_serialize_dense_nodes_primative_block(block: PrimitiveBlock) {
         let mut batch = MockRocksBatch::default();
 
-        let mut stringtable = StringTable::default();
+        let stringtable = Mutex::new(StringTable::default());
 
-        let stats = serialize_dense_nodes_primative_block(
-            &block,
-            100,
-            &mut batch,
-            &mut stringtable,
-            1_000_000,
-        );
+        let stats =
+            serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000);
 
         assert!(stats.is_ok());
 
@@ -276,17 +298,12 @@ mod tests {
 
     fn assert_serialize_dense_nodes_with_tags(block: PrimitiveBlock) {
         let mut batch = MockRocksBatch::default();
-        let mut stringtable = StringTable::default();
+        let stringtable = Mutex::new(StringTable::default());
 
         // Run the serialization function
-        let stats = serialize_dense_nodes_primative_block(
-            &block,
-            100,
-            &mut batch,
-            &mut stringtable,
-            1_000_000,
-        )
-        .unwrap();
+        let stats =
+            serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000)
+                .unwrap();
 
         // Verify that three nodes were processed
         assert_eq!(stats.num_nodes, 3);
