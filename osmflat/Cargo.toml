@@ -20,6 +20,7 @@ space-time = "0.5.0"
 
 [dev-dependencies]
 clap = { version = "4.1.4", features = ["derive"] }
+criterion = "0.5"
 itertools = "0.13.0"
 png = "0.17.7"
 serde = { version = "1.0.152", features = ["derive"] }
@@ -30,3 +31,11 @@ svg = "0.17.0"
 [features]
 default = []
 tar = ["flatdata/tar"]
+# Exposes `osmflat::test_support` (synthetic-archive builders) to integration
+# tests and benchmarks, which only see the crate's public API.
+test-support = []
+
+[[bench]]
+name = "spatial"
+harness = false
+required-features = ["test-support"]
