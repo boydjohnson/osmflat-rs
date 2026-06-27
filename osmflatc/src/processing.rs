@@ -17,21 +17,21 @@ pub const RELATIONS: &str = "relations";
 /// order as [`RELATIONS`].
 pub const RELATIONS_STRING_REFS: &str = "relations_string_refs";
 
-#[cfg(test)]
-mod mock;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mock;
 pub mod node;
 pub(crate) mod storage;
 pub mod way;
 
-pub(crate) trait Key: From<Box<[u8]>> {
+pub trait Key: From<Box<[u8]>> {
     fn serialize(&self) -> Vec<u8>;
 }
 
-pub(crate) trait Value: From<Box<[u8]>> {
+pub trait Value: From<Box<[u8]>> {
     fn serialize(&self) -> Vec<u8>;
 }
 
-pub(crate) trait TempDataCodec {
+pub trait TempDataCodec {
     type Key: Key;
     type Value: Value;
     const NAME: &'static str;

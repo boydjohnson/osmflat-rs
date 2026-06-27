@@ -22,7 +22,11 @@ use storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodeLonLatValue, NodeValue, Nod
 
 pub(crate) mod storage;
 
-fn serialize_dense_nodes_primative_block(
+/// Serialize a single dense-node `PrimitiveBlock` into the temporary RocksDB
+/// `batch`, computing each node's spatial-curve key. Exposed (rather than
+/// private) so benchmarks can drive it with a [`mock`](crate::processing::mock)
+/// batch and synthetic blocks.
+pub fn serialize_dense_nodes_primative_block(
     block: &osmpbf::PrimitiveBlock,
     granularity: i32,
     batch: &mut impl RocksDBUnsync,
@@ -300,15 +304,12 @@ mod tests {
         let mut batch = MockRocksBatch::default();
         let stringtable = Mutex::new(StringTable::default());
 
-        // Run the serialization function
         let stats =
             serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000)
                 .unwrap();
 
-        // Verify that three nodes were processed
         assert_eq!(stats.num_nodes, 3);
 
-        // Collect nodes from the batch
         let mut iter = batch.iterator::<NodesTDC>().unwrap();
         let mut nodes = vec![];
         while let Some(Ok((k, v))) = iter.next() {
@@ -316,29 +317,26 @@ mod tests {
         }
         assert_eq!(nodes.len(), 3);
 
-        // Map nodes by ID for easy access
         let mut node_map = std::collections::HashMap::new();
         for (k, v) in nodes {
             node_map.insert(k.id, v);
         }
 
-        // Helper function to insert strings into the stringtable and get their indices
         fn get_string(stringtable: &mut StringTable, s: &str) -> u64 {
             stringtable.insert(s)
         }
 
-        // Rebuild the stringtable to match the one used during serialization
+        // Rebuild the stringtable in the same order serialization used, so the
+        // expected indices line up.
         let mut test_stringtable = StringTable::default();
         for s in &block.stringtable.s {
             test_stringtable.insert(&String::from_utf8(s.clone()).unwrap());
         }
 
-        // Verify tags for each node
         for id in [1, 2, 3] {
             let node_value = node_map.get(&id).expect("Node not found");
 
             if id == 1 {
-                // Expected tags for node 1
                 let key_refs = vec![
                     (
                         get_string(&mut test_stringtable, "amenity"),
@@ -351,7 +349,6 @@ mod tests {
                 ];
                 assert_eq!(node_value.refs, key_refs);
             } else if id == 2 {
-                // Expected tags for node 2
                 let key_refs = vec![
                     (
                         get_string(&mut test_stringtable, "amenity"),
@@ -364,7 +361,6 @@ mod tests {
                 ];
                 assert_eq!(node_value.refs, key_refs);
             } else if id == 3 {
-                // Node 3 has no tags
                 assert!(node_value.refs.is_empty());
             }
         }

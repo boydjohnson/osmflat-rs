@@ -14,6 +14,25 @@ categories = ["encoding"]
 readme = "README.md"
 edition = "2021"
 
+[lib]
+name = "osmflatc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "osmflatc"
+path = "src/main.rs"
+
+[features]
+default = []
+# Exposes the internal processing stages + mock RocksDB batch so benchmarks
+# (which see only the public API) can drive them with synthetic PrimitiveBlocks.
+test-support = []
+
+[[bench]]
+name = "processing"
+harness = false
+required-features = ["test-support"]
+
 [dependencies]
 byteorder = "1.4.3"
 bytes = "1.4.0"
@@ -45,4 +64,5 @@ tempfile = "3.10.0"
 prost-build = "0.13.2"
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1.0.0"
