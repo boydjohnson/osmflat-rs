@@ -39,3 +39,8 @@ test-support = []
 name = "spatial"
 harness = false
 required-features = ["test-support"]
+
+[[bench]]
+name = "max_ranges"
+harness = false
+required-features = ["test-support"]

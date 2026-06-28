@@ -147,6 +147,23 @@ fn partition_point_by(len: usize, mut pred: impl FnMut(usize) -> bool) -> usize 
     lo
 }
 
+/// Maximum number of space-filling-curve ranges the bounding-box queries ask
+/// [`XZ2SFC::ranges`] to produce for ways and relations. `None` lets it refine
+/// fully (the most ranges, and the most range-generation cost); a cap stops
+/// refinement early, yielding coarser ranges that are cheaper to produce but
+/// over-select more candidates for the exact-overlap filter to drop.
+/// Correctness is unaffected either way — coverage is preserved.
+///
+/// `Some(64)` is the sweet spot of the `max_ranges` bench (the `ranges()` alloc
+/// is the profiled hotspot). The optimum cap grows with query-box size, so 64 is
+/// chosen to balance across box sizes: near-optimal on tight/medium boxes (the
+/// common case — ways ~130/180 µs, relations ~95/100 µs) with a bounded worst
+/// case on wide boxes (ways ~520 µs, relations ~160 µs). That worst case is still
+/// ~44×/114× faster than `None`, whose cost explodes with box size (ways reach
+/// ~23 ms on a wide box). `Some(8)` is uniformly worse — too coarse, it
+/// over-selects a huge candidate set.
+const BBOX_QUERY_MAX_RANGES: Option<u16> = Some(64);
+
 /// Return [Way]s that are in the archive and inside the bounding box.
 ///
 /// #Note: Includes those [Way]s that overlap the bounding box without
@@ -158,13 +175,38 @@ pub fn find_ways_by_bounding_box(
     xmax: f64,
     ymax: f64,
 ) -> impl Iterator<Item = &Way> {
+    find_ways_capped(archive, xmin, ymin, xmax, ymax, BBOX_QUERY_MAX_RANGES)
+}
+
+/// [`find_ways_by_bounding_box`] with an explicit `XZ2SFC::ranges` cap, exposed
+/// for benchmarking the effect of [`BBOX_QUERY_MAX_RANGES`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn find_ways_by_bounding_box_capped(
+    archive: &Osm,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    max_ranges: Option<u16>,
+) -> impl Iterator<Item = &Way> {
+    find_ways_capped(archive, xmin, ymin, xmax, ymax, max_ranges)
+}
+
+fn find_ways_capped(
+    archive: &Osm,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    max_ranges: Option<u16>,
+) -> impl Iterator<Item = &Way> {
     let curve = way_curve();
     let coord_scale = archive.header().coord_scale() as f64;
     // Exclude the trailing sentinel way.
     let num_ways = archive.ways().len().saturating_sub(1);
 
     curve
-        .ranges(xmin, ymin, xmax, ymax, None)
+        .ranges(xmin, ymin, xmax, ymax, max_ranges)
         .into_iter()
         .flat_map(move |b| {
             let lower = partition_point_by(num_ways, |i| {
@@ -226,13 +268,38 @@ pub fn find_relations_by_bounding_box(
     xmax: f64,
     ymax: f64,
 ) -> impl Iterator<Item = &Relation> {
+    find_relations_capped(archive, xmin, ymin, xmax, ymax, BBOX_QUERY_MAX_RANGES)
+}
+
+/// [`find_relations_by_bounding_box`] with an explicit `XZ2SFC::ranges` cap,
+/// exposed for benchmarking the effect of [`BBOX_QUERY_MAX_RANGES`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn find_relations_by_bounding_box_capped(
+    archive: &Osm,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    max_ranges: Option<u16>,
+) -> impl Iterator<Item = &Relation> {
+    find_relations_capped(archive, xmin, ymin, xmax, ymax, max_ranges)
+}
+
+fn find_relations_capped(
+    archive: &Osm,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    max_ranges: Option<u16>,
+) -> impl Iterator<Item = &Relation> {
     let curve = way_curve();
     let coord_scale = archive.header().coord_scale() as f64;
     // Exclude the trailing sentinel relation.
     let num_relations = archive.relations().len().saturating_sub(1);
 
     curve
-        .ranges(xmin, ymin, xmax, ymax, None)
+        .ranges(xmin, ymin, xmax, ymax, max_ranges)
         .into_iter()
         .flat_map(move |b| {
             let relations = &archive.relations()[..num_relations];
@@ -352,5 +419,61 @@ mod tests {
             find_nodes_by_bounding_box(&archive, 10.0, 10.0, 11.0, 11.0).count(),
             0
         );
+    }
+
+    /// Ground-truth regression for the bbox queries: across a spread of
+    /// off-center boxes, a small `XZ2SFC::ranges` cap must return exactly the
+    /// entities whose bbox overlaps the query (brute force). This guards the
+    /// query path against the under-coverage that full refinement (`None`)
+    /// exhibits at box boundaries.
+    #[test]
+    fn small_cap_matches_brute_force() {
+        use crate::test_support::{generate_relation_archive, generate_way_archive};
+
+        let (lon_min, lat_min, lon_max, lat_max) = (-97.5, 43.0, -89.5, 49.5);
+        let ways = generate_way_archive(5000, 8, lon_min, lat_min, lon_max, lat_max, 7);
+        let rels = generate_relation_archive(5000, lon_min, lat_min, lon_max, lat_max, 7);
+        let cs = ways.header().coord_scale() as f64;
+
+        let mut s = 0x1234_5678u64;
+        let mut u = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (s >> 33) as f64 / (1u64 << 31) as f64
+        };
+
+        for _ in 0..12 {
+            let frac = 0.05 + u() * 0.55;
+            let wlon = (lon_max - lon_min) * frac;
+            let wlat = (lat_max - lat_min) * frac;
+            let x0 = lon_min + u() * (lon_max - lon_min - wlon);
+            let y0 = lat_min + u() * (lat_max - lat_min - wlat);
+            let (x1, y1) = (x0 + wlon, y0 + wlat);
+            let overlaps = |min_x: f64, min_y: f64, max_x: f64, max_y: f64| {
+                !(max_x < x0 || min_x > x1 || max_y < y0 || min_y > y1)
+            };
+
+            let nw = ways.ways().len().saturating_sub(1);
+            let bf_w = (0..nw)
+                .filter(|&i| way_bounding_box(&ways, i, cs).is_some_and(|(a, b, c, d)| overlaps(a, b, c, d)))
+                .count();
+            let nr = rels.relations().len().saturating_sub(1);
+            let bf_r = rels.relations()[..nr]
+                .iter()
+                .filter(|r| relation_bbox(r, cs).is_some_and(|(a, b, c, d)| overlaps(a, b, c, d)))
+                .count();
+
+            for cap in [Some(1u16), Some(8), Some(64), None] {
+                assert_eq!(
+                    find_ways_by_bounding_box_capped(&ways, x0, y0, x1, y1, cap).count(),
+                    bf_w,
+                    "ways cap={cap:?} box=({x0:.2},{y0:.2},{x1:.2},{y1:.2})"
+                );
+                assert_eq!(
+                    find_relations_by_bounding_box_capped(&rels, x0, y0, x1, y1, cap).count(),
+                    bf_r,
+                    "relations cap={cap:?} box=({x0:.2},{y0:.2},{x1:.2},{y1:.2})"
+                );
+            }
+        }
     }
 }
