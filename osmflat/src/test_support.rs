@@ -143,13 +143,33 @@ pub fn build_archive(
     Osm::open(storage).unwrap()
 }
 
+/// Small deterministic RNG (SplitMix64) used by the synthetic-archive
+/// generators so benchmark runs are reproducible from their seed.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+
+    /// Next value in `[0, 1)`.
+    fn next_unit(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
 /// Deterministically generate a synthetic archive of `num_ways` ways, each
 /// referencing `refs_per_way` nodes, scattered across the bounding box
 /// `(lon_min, lat_min, lon_max, lat_max)`. Returns an archive laid out via
 /// [`build_archive`], suitable for benchmarking the spatial query functions.
 ///
-/// The generator is a pure function of its arguments (a simple LCG seeded by
-/// `seed`), so benchmark runs are reproducible.
+/// The generator is a pure function of its arguments (seeded by `seed`), so
+/// benchmark runs are reproducible.
 pub fn generate_way_archive(
     num_ways: usize,
     refs_per_way: usize,
@@ -159,17 +179,7 @@ pub fn generate_way_archive(
     lat_max: f64,
     seed: u64,
 ) -> Osm {
-    let mut state = seed | 1;
-    let mut next = || {
-        // SplitMix64-style step; cheap and deterministic.
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z = z ^ (z >> 31);
-        (z >> 11) as f64 / (1u64 << 53) as f64 // in [0, 1)
-    };
-
+    let mut rng = Rng::new(seed);
     let lon_span = lon_max - lon_min;
     let lat_span = lat_max - lat_min;
     let mut node_lonlat: Vec<(f64, f64)> = Vec::with_capacity(num_ways * refs_per_way);
@@ -178,12 +188,14 @@ pub fn generate_way_archive(
     for _ in 0..num_ways {
         // Anchor the way somewhere in the box, then jitter its nodes in a small
         // neighbourhood so ways have a realistic, non-degenerate bounding box.
-        let anchor_lon = lon_min + next() * lon_span;
-        let anchor_lat = lat_min + next() * lat_span;
+        let anchor_lon = lon_min + rng.next_unit() * lon_span;
+        let anchor_lat = lat_min + rng.next_unit() * lat_span;
         let mut refs = Vec::with_capacity(refs_per_way);
         for _ in 0..refs_per_way {
-            let lon = (anchor_lon + (next() - 0.5) * lon_span * 0.01).clamp(lon_min, lon_max);
-            let lat = (anchor_lat + (next() - 0.5) * lat_span * 0.01).clamp(lat_min, lat_max);
+            let lon =
+                (anchor_lon + (rng.next_unit() - 0.5) * lon_span * 0.01).clamp(lon_min, lon_max);
+            let lat =
+                (anchor_lat + (rng.next_unit() - 0.5) * lat_span * 0.01).clamp(lat_min, lat_max);
             refs.push(node_lonlat.len());
             node_lonlat.push((lon, lat));
         }
@@ -191,4 +203,66 @@ pub fn generate_way_archive(
     }
 
     build_archive(&node_lonlat, &ways, &[])
+}
+
+/// Deterministically generate a synthetic archive of `num_nodes` standalone
+/// nodes scattered uniformly across `(lon_min, lat_min, lon_max, lat_max)`.
+/// Laid out via [`build_archive`], for benchmarking
+/// [`find_nodes_by_bounding_box`](crate::find_nodes_by_bounding_box).
+pub fn generate_node_archive(
+    num_nodes: usize,
+    lon_min: f64,
+    lat_min: f64,
+    lon_max: f64,
+    lat_max: f64,
+    seed: u64,
+) -> Osm {
+    let mut rng = Rng::new(seed);
+    let lon_span = lon_max - lon_min;
+    let lat_span = lat_max - lat_min;
+    let node_lonlat: Vec<(f64, f64)> = (0..num_nodes)
+        .map(|_| {
+            (
+                lon_min + rng.next_unit() * lon_span,
+                lat_min + rng.next_unit() * lat_span,
+            )
+        })
+        .collect();
+
+    build_archive(&node_lonlat, &[], &[])
+}
+
+/// Deterministically generate a synthetic archive of `num_relations` relations,
+/// each with a small bounding box anchored uniformly across `(lon_min, lat_min,
+/// lon_max, lat_max)`. Laid out via [`build_archive`], for benchmarking
+/// [`find_relations_by_bounding_box`](crate::find_relations_by_bounding_box).
+pub fn generate_relation_archive(
+    num_relations: usize,
+    lon_min: f64,
+    lat_min: f64,
+    lon_max: f64,
+    lat_max: f64,
+    seed: u64,
+) -> Osm {
+    let mut rng = Rng::new(seed);
+    let lon_span = lon_max - lon_min;
+    let lat_span = lat_max - lat_min;
+    let relation_bboxes: Vec<Option<(f64, f64, f64, f64)>> = (0..num_relations)
+        .map(|_| {
+            // Anchor a small box in the region; half-extents stay positive so
+            // min <= max always holds after clamping to the region.
+            let cx = lon_min + rng.next_unit() * lon_span;
+            let cy = lat_min + rng.next_unit() * lat_span;
+            let hw = rng.next_unit() * lon_span * 0.01;
+            let hh = rng.next_unit() * lat_span * 0.01;
+            Some((
+                (cx - hw).max(lon_min),
+                (cy - hh).max(lat_min),
+                (cx + hw).min(lon_max),
+                (cy + hh).min(lat_max),
+            ))
+        })
+        .collect();
+
+    build_archive(&[], &[], &relation_bboxes)
 }
