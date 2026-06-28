@@ -578,19 +578,17 @@ pub fn run(args: Args) -> Result<(), Error> {
         .as_deref()
         .unwrap_or_else(|| args.output.parent().unwrap_or_else(|| Path::new(".")));
 
-    // Bound RocksDB's open SST handles to the available fd budget. Reserve
-    // headroom for the input mmap, the flatdata output vectors, RocksDB's own
-    // metadata files and stdio; cap so RocksDB never hogs the whole budget on a
-    // machine with a very high limit.
-    let fd_limit = raise_open_file_limit();
-    let max_open_files = fd_limit.saturating_sub(256).clamp(64, 8192) as i32;
-    info!("Open-file limit: {fd_limit}, RocksDB max_open_files: {max_open_files}");
+    // RocksDB keeps an fd open per cached SST file; a large ingest produces
+    // thousands of SSTs across the scratch DB's column families. The cap is set
+    // via `--max-open-files` (-1 = unlimited) and must stay below the process
+    // open-file limit, which the caller raises with `ulimit -n` as needed.
+    info!("RocksDB max_open_files: {}", args.max_open_files);
 
     let (db, _scratch) = create_db(
         scratch_parent,
         args.block_cache_mb * 1024 * 1024,
         args.write_buffer_mb * 1024 * 1024,
-        max_open_files,
+        args.max_open_files,
     )?;
 
     let mut stats = Stats::default();
@@ -662,44 +660,4 @@ pub fn run(args: Args) -> Result<(), Error> {
     println!("{stats}");
     println!("{missing}");
     Ok(())
-}
-
-/// Raise the soft open-file limit toward the hard limit and return the
-/// resulting soft limit. The scratch RocksDB keeps an fd open per SST file, so
-/// a large ingest needs far more than the default soft limit (256 on macOS).
-///
-/// Best-effort: on any failure the current soft limit is returned unchanged.
-/// On macOS the hard limit is reported as "unlimited" but `setrlimit` rejects
-/// anything above `kern.maxfilesperproc`, so probe a few sane targets from high
-/// to low rather than asking for the hard limit directly.
-#[cfg(unix)]
-fn raise_open_file_limit() -> u64 {
-    // SAFETY: plain libc rlimit syscalls on a zeroed POD struct.
-    unsafe {
-        let mut rlim = std::mem::zeroed::<libc::rlimit>();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return 256;
-        }
-        let hard = rlim.rlim_max as u64;
-        for target in [65536u64, 24576, 10240] {
-            let want = target.min(hard);
-            if want <= rlim.rlim_cur as u64 {
-                break;
-            }
-            let new = libc::rlimit {
-                rlim_cur: want as libc::rlim_t,
-                rlim_max: rlim.rlim_max,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
-                rlim.rlim_cur = want as libc::rlim_t;
-                break;
-            }
-        }
-        rlim.rlim_cur as u64
-    }
-}
-
-#[cfg(not(unix))]
-fn raise_open_file_limit() -> u64 {
-    256
 }

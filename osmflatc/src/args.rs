@@ -32,4 +32,10 @@ pub struct Args {
     /// Scratch RocksDB write buffer (MiB); raise for higher write throughput
     #[arg(long = "write-buffer-mb", default_value_t = 128)]
     pub write_buffer_mb: usize,
+
+    /// Max open SST files RocksDB may cache (-1 = unlimited). Must stay below
+    /// the process open-file limit (raise it with `ulimit -n`); lower this
+    /// if you hit "Too many open files"
+    #[arg(long = "max-open-files", default_value_t = -1)]
+    pub max_open_files: i32,
 }
