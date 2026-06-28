@@ -1,5 +1,11 @@
 use std::collections::BTreeSet;
 
+/// RocksDB column family holding the encoded relations, keyed by spatial order.
+pub const RELATIONS: &str = "relations";
+/// RocksDB column family holding the relations' string references, in the same
+/// order as [`RELATIONS`].
+pub const RELATIONS_STRING_REFS: &str = "relations_string_refs";
+
 pub fn create_relation_values(string_refs: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 * string_refs.len());
     for s in string_refs {

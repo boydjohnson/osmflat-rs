@@ -10,16 +10,12 @@ use tempfile::TempDir;
 use way::storage::{WayIdToIdxTDC, WayIdToMbbTDC, WayTDC};
 
 use crate::error::OsmFlatcError;
-
-/// RocksDB column family holding the encoded relations, keyed by spatial order.
-pub const RELATIONS: &str = "relations";
-/// RocksDB column family holding the relations' string references, in the same
-/// order as [`RELATIONS`].
-pub const RELATIONS_STRING_REFS: &str = "relations_string_refs";
+use relation::storage::{RELATIONS, RELATIONS_STRING_REFS};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod node;
+pub mod relation;
 pub(crate) mod storage;
 pub mod way;
 

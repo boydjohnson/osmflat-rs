@@ -19,7 +19,6 @@ pub mod osmpbf;
 pub mod processing;
 mod run;
 pub mod stats;
-pub mod storage;
 pub mod strings;
 
 pub use run::run;
