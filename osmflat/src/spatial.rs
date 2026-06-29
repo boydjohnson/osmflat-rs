@@ -56,9 +56,10 @@ pub fn find_nodes_by_bounding_box(
     let coord_scale = archive.header().coord_scale();
     let ranges = curve.ranges(xmin, ymin, xmax, ymax, &[]);
 
-    // The last node is a sentinel that only carries the end of the tag range;
-    // it has no real location and must be excluded from the ordered search.
-    let num_nodes = archive.nodes().len().saturating_sub(1);
+    // `Node` carries a `@range` field, so flatdata trims the trailing
+    // range-overlap sentinel out of the slice: `len()` is already the count of
+    // real nodes, all of which take part in the search.
+    let num_nodes = archive.nodes().len();
 
     ranges
         .into_iter()
@@ -99,10 +100,12 @@ fn way_bounding_box(
     coord_scale: f64,
 ) -> Option<(f64, f64, f64, f64)> {
     let ways = archive.ways();
-    // `way_idx` is always < num_ways, so the sentinel guarantees `way_idx + 1`
-    // is in bounds and yields the end of this way's node range.
-    let begin = ways[way_idx].ref_first_idx() as usize;
-    let end = ways[way_idx + 1].ref_first_idx() as usize;
+    // The generated `refs()` range reads the *next* way's `ref_first_idx`
+    // straight from the backing buffer (which includes the trailing overlap
+    // sentinel), so it is valid even for the last real way -- unlike indexing
+    // `ways[way_idx + 1]`, which would run off the sentinel-trimmed slice.
+    let refs = ways[way_idx].refs();
+    let (begin, end) = (refs.start as usize, refs.end as usize);
 
     let nodes_index = archive.nodes_index();
     let nodes = archive.nodes();
@@ -202,8 +205,9 @@ fn find_ways_capped(
 ) -> impl Iterator<Item = &Way> {
     let curve = way_curve();
     let coord_scale = archive.header().coord_scale() as f64;
-    // Exclude the trailing sentinel way.
-    let num_ways = archive.ways().len().saturating_sub(1);
+    // `Way` has `@range` fields, so flatdata trims its overlap sentinel out of
+    // the slice: `len()` is the real way count.
+    let num_ways = archive.ways().len();
 
     curve
         .ranges(xmin, ymin, xmax, ymax, max_ranges)
@@ -295,8 +299,9 @@ fn find_relations_capped(
 ) -> impl Iterator<Item = &Relation> {
     let curve = way_curve();
     let coord_scale = archive.header().coord_scale() as f64;
-    // Exclude the trailing sentinel relation.
-    let num_relations = archive.relations().len().saturating_sub(1);
+    // `Relation` has a `@range` field, so flatdata trims its overlap sentinel
+    // out of the slice: `len()` is the real relation count.
+    let num_relations = archive.relations().len();
 
     curve
         .ranges(xmin, ymin, xmax, ymax, max_ranges)
@@ -412,6 +417,50 @@ mod tests {
     }
 
     #[test]
+    fn last_entity_in_z_order_is_not_dropped() {
+        // A world-covering box must return *every* entity, including whichever
+        // sorts last in spatial order. This guards the off-by-one where the
+        // queries excluded the last real entity by over-applying
+        // `saturating_sub(1)` to a `len()` that already omits the flatdata
+        // range-overlap sentinel.
+        let nodes = vec![
+            (-93.0, 45.0),
+            (2.3, 48.8),
+            (139.7, 35.7),
+            (-0.1, 51.5),
+            (151.2, -33.9),
+        ];
+        let world = (-180.0, -90.0, 180.0, 90.0);
+
+        let a = build_archive(&nodes, &[], &[]);
+        assert_eq!(
+            find_nodes_by_bounding_box(&a, world.0, world.1, world.2, world.3).count(),
+            nodes.len(),
+            "every node must be returned"
+        );
+
+        let ways = vec![vec![0, 1], vec![2, 3], vec![3, 4]];
+        let a = build_archive(&nodes, &ways, &[]);
+        assert_eq!(
+            find_ways_by_bounding_box(&a, world.0, world.1, world.2, world.3).count(),
+            ways.len(),
+            "every way must be returned"
+        );
+
+        let rels = vec![
+            Some((-93.2, 44.9, -92.9, 45.2)),
+            Some((2.0, 48.0, 3.0, 49.0)),
+            Some((150.0, -34.0, 152.0, -33.0)),
+        ];
+        let a = build_archive(&[], &[], &rels);
+        assert_eq!(
+            find_relations_by_bounding_box(&a, world.0, world.1, world.2, world.3).count(),
+            rels.len(),
+            "every relation must be returned"
+        );
+    }
+
+    #[test]
     fn empty_box_far_away_finds_nothing() {
         let nodes = vec![(-93.0, 45.0), (-93.1, 45.1)];
         let archive = build_archive(&nodes, &[], &[]);
@@ -452,13 +501,13 @@ mod tests {
                 !(max_x < x0 || min_x > x1 || max_y < y0 || min_y > y1)
             };
 
-            let nw = ways.ways().len().saturating_sub(1);
+            let nw = ways.ways().len();
             let bf_w = (0..nw)
                 .filter(|&i| {
                     way_bounding_box(&ways, i, cs).is_some_and(|(a, b, c, d)| overlaps(a, b, c, d))
                 })
                 .count();
-            let nr = rels.relations().len().saturating_sub(1);
+            let nr = rels.relations().len();
             let bf_r = rels.relations()[..nr]
                 .iter()
                 .filter(|r| relation_bbox(r, cs).is_some_and(|(a, b, c, d)| overlaps(a, b, c, d)))

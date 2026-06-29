@@ -9,8 +9,8 @@
 use flatdata::MemoryResourceStorage;
 
 use crate::{
-    bbox_index, node_curve, node_index, way_curve, Header, Node, NodeIndex, Osm, OsmBuilder,
-    Relation, Way, RELATION_NO_BBOX,
+    bbox_index, node_curve, node_index, way_curve, Header, Node, Osm, OsmBuilder, Relation, Way,
+    RELATION_NO_BBOX,
 };
 
 /// Coordinate scale used by the synthetic archives (matches osmium / osmflatc's
@@ -56,19 +56,23 @@ pub fn build_archive(
     for (pos, &orig) in order.iter().enumerate() {
         final_idx[orig] = pos as u64;
     }
-    let mut node_vec: Vec<Node> = order
-        .iter()
-        .map(|&orig| {
+    // Build via `grow()`/`close()` exactly like osmflatc (not `set_nodes`), so
+    // the flatdata range-overlap sentinel is the last *grown* element and gets
+    // trimmed from the slice -- making `nodes().len()` the real count, matching
+    // real archives. (`set_nodes(&vec_with_sentinel)` would instead leave the
+    // sentinel counted, len == real + 1, masking the off-by-one.)
+    {
+        let mut nodes = builder.start_nodes().unwrap();
+        for &orig in &order {
             let (lon, lat) = node_lonlat[orig];
-            let mut n = unsafe { Node::new_unchecked() };
+            let n = nodes.grow().unwrap();
             n.set_lon(scale(lon));
             n.set_lat(scale(lat));
             n.set_tag_first_idx(0);
-            n
-        })
-        .collect();
-    node_vec.push(unsafe { Node::new_unchecked() }); // sentinel
-    builder.set_nodes(&node_vec).unwrap();
+        }
+        nodes.grow().unwrap().set_tag_first_idx(0); // range-overlap sentinel
+        nodes.close().unwrap();
+    }
 
     // Ways, ordered by the bounding-box curve.
     let wcurve = way_curve();
@@ -88,25 +92,24 @@ pub fn build_archive(
         let (a, b, c, d) = way_bbox(&ways[i]);
         bbox_index(&wcurve, a, b, c, d)
     });
-    let mut way_vec: Vec<Way> = Vec::new();
-    let mut nodes_index_vec: Vec<NodeIndex> = Vec::new();
-    for &wi in &worder {
-        let mut w = unsafe { Way::new_unchecked() };
-        w.set_tag_first_idx(0);
-        w.set_ref_first_idx(nodes_index_vec.len() as u64);
-        for &ni in &ways[wi] {
-            let mut idx = NodeIndex::new();
-            idx.set_value(Some(final_idx[ni]));
-            nodes_index_vec.push(idx);
+    {
+        let mut ways_vec = builder.start_ways().unwrap();
+        let mut nodes_index = builder.start_nodes_index().unwrap();
+        for &wi in &worder {
+            let w = ways_vec.grow().unwrap();
+            w.set_tag_first_idx(0);
+            w.set_ref_first_idx(nodes_index.len() as u64);
+            for &ni in &ways[wi] {
+                nodes_index.grow().unwrap().set_value(Some(final_idx[ni]));
+            }
         }
-        way_vec.push(w);
+        // Sentinel terminates the last way's ref range (read via `Way::refs()`).
+        let s = ways_vec.grow().unwrap();
+        s.set_tag_first_idx(0);
+        s.set_ref_first_idx(nodes_index.len() as u64);
+        ways_vec.close().unwrap();
+        nodes_index.close().unwrap();
     }
-    let mut sentinel_way = unsafe { Way::new_unchecked() }; // sentinel terminates the ref range
-    sentinel_way.set_tag_first_idx(0);
-    sentinel_way.set_ref_first_idx(nodes_index_vec.len() as u64);
-    way_vec.push(sentinel_way);
-    builder.set_ways(&way_vec).unwrap();
-    builder.set_nodes_index(&nodes_index_vec).unwrap();
 
     // Relations, ordered by the bounding-box curve; no-location relations
     // get the sentinel mbb and sort last (key u64::MAX).
@@ -116,23 +119,22 @@ pub fn build_archive(
     };
     let mut rorder: Vec<usize> = (0..relation_bboxes.len()).collect();
     rorder.sort_by_key(|&i| rel_key(relation_bboxes[i]));
-    let mut rel_vec: Vec<Relation> = rorder
-        .iter()
-        .map(|&ri| {
+    {
+        let mut rels = builder.start_relations().unwrap();
+        for &ri in &rorder {
             let mbb = relation_bboxes[ri]
                 .map(|(a, b, c, d)| [scale(a), scale(b), scale(c), scale(d)])
                 .unwrap_or(RELATION_NO_BBOX);
-            let mut r = unsafe { Relation::new_unchecked() };
+            let r = rels.grow().unwrap();
             r.set_tag_first_idx(0);
             r.set_min_lon(mbb[0]);
             r.set_min_lat(mbb[1]);
             r.set_max_lon(mbb[2]);
             r.set_max_lat(mbb[3]);
-            r
-        })
-        .collect();
-    rel_vec.push(unsafe { Relation::new_unchecked() }); // sentinel
-    builder.set_relations(&rel_vec).unwrap();
+        }
+        rels.grow().unwrap().set_tag_first_idx(0); // range-overlap sentinel
+        rels.close().unwrap();
+    }
 
     // Remaining resources are required to open the archive but unused here.
     builder.start_relation_members().unwrap().close().unwrap();
