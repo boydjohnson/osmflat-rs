@@ -21,6 +21,10 @@ copied and modified.
   archive's spatial ordering. Note that negative coordinates must use the
   `--lon-min=-93.3` form so they are not parsed as flags, e.g.:
   `spatial archive.osmflat --lon-min=-93.3 --lon-max=-93.2 --lat-min=44.9 --lat-max=45.0 --osm-type node`
+* `lookup-by-id` - looks up an entity by its OSM id and prints it, demonstrating
+  the id&nbsp;&harr;&nbsp;index helpers. Requires an archive built with
+  `osmflatc --reverse-ids`, e.g.:
+  `lookup-by-id archive.osmflat --osm-type way --id 1052180974`
 
 ## Rendering
 
