@@ -80,7 +80,7 @@ pub fn find_nodes_by_bounding_box(
         })
 }
 
-fn spatial_index_node(curve: &ZCurve2D, node: &Node, coord_scale: i32) -> u64 {
+pub(crate) fn spatial_index_node(curve: &ZCurve2D, node: &Node, coord_scale: i32) -> u64 {
     let lat = node.lat() as f64 / coord_scale as f64;
     let lon = node.lon() as f64 / coord_scale as f64;
 
@@ -126,7 +126,12 @@ fn way_bounding_box(
     bbox
 }
 
-fn spatial_index_way(archive: &Osm, curve: &XZ2SFC, way_idx: usize, coord_scale: f64) -> u64 {
+pub(crate) fn spatial_index_way(
+    archive: &Osm,
+    curve: &XZ2SFC,
+    way_idx: usize,
+    coord_scale: f64,
+) -> u64 {
     match way_bounding_box(archive, way_idx, coord_scale) {
         Some((min_x, min_y, max_x, max_y)) => bbox_index(curve, min_x, min_y, max_x, max_y),
         None => 0,
@@ -252,7 +257,7 @@ fn relation_bbox(relation: &Relation, coord_scale: f64) -> Option<(f64, f64, f64
     ))
 }
 
-fn spatial_index_relation(curve: &XZ2SFC, relation: &Relation, coord_scale: f64) -> u64 {
+pub(crate) fn spatial_index_relation(curve: &XZ2SFC, relation: &Relation, coord_scale: f64) -> u64 {
     // Sentinel relations sort last and are never matched; they share the key
     // the compiler used, keeping the binary search monotonic.
     match relation_bbox(relation, coord_scale) {

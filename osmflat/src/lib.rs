@@ -41,6 +41,7 @@ include!("osmflat_generated.rs");
 mod ids;
 mod spatial;
 mod tags;
+mod verify;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -49,6 +50,7 @@ pub use crate::ids::*;
 pub use crate::osm::*;
 pub use crate::spatial::*;
 pub use crate::tags::*;
+pub use crate::verify::*;
 
 // re-export what is needed from flatdata to use osmflat
 pub use flatdata::FileResourceStorage;

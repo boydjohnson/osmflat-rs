@@ -9,8 +9,7 @@
 use flatdata::MemoryResourceStorage;
 
 use crate::{
-    bbox_index, node_curve, node_index, way_curve, Header, Node, Osm, OsmBuilder, Relation, Way,
-    RELATION_NO_BBOX,
+    bbox_index, node_curve, node_index, way_curve, Header, Osm, OsmBuilder, RELATION_NO_BBOX,
 };
 
 /// Coordinate scale used by the synthetic archives (matches osmium / osmflatc's
@@ -136,8 +135,16 @@ pub fn build_archive(
         rels.close().unwrap();
     }
 
-    // Remaining resources are required to open the archive but unused here.
-    builder.start_relation_members().unwrap().close().unwrap();
+    // One member list per relation, satisfying the `relations` <->
+    // `relation_members` implicit binding (lists are empty -- members aren't
+    // needed by the spatial queries these fixtures exercise).
+    {
+        let mut rm = builder.start_relation_members().unwrap();
+        for _ in 0..rorder.len() {
+            rm.grow().unwrap();
+        }
+        rm.close().unwrap();
+    }
     builder.set_tags(&[]).unwrap();
     builder.set_tags_index(&[]).unwrap();
     builder.set_stringtable(b"\0").unwrap();
@@ -168,19 +175,19 @@ pub fn build_node_archive_with_ids(nodes: &[(f64, f64, u64)]) -> Osm {
     let mut order: Vec<usize> = (0..nodes.len()).collect();
     order.sort_by_key(|&i| node_index(&curve, nodes[i].0, nodes[i].1));
 
-    let mut node_vec: Vec<Node> = order
-        .iter()
-        .map(|&orig| {
+    // grow()-based like osmflatc, so `nodes().len()` is the real count.
+    {
+        let mut nodes_ev = builder.start_nodes().unwrap();
+        for &orig in &order {
             let (lon, lat, _) = nodes[orig];
-            let mut n = unsafe { Node::new_unchecked() };
+            let n = nodes_ev.grow().unwrap();
             n.set_lon(scale(lon));
             n.set_lat(scale(lat));
             n.set_tag_first_idx(0);
-            n
-        })
-        .collect();
-    node_vec.push(unsafe { Node::new_unchecked() }); // sentinel, no id
-    builder.set_nodes(&node_vec).unwrap();
+        }
+        nodes_ev.grow().unwrap().set_tag_first_idx(0); // range-overlap sentinel
+        nodes_ev.close().unwrap();
+    }
 
     let ids = builder.ids().unwrap();
 
@@ -214,13 +221,21 @@ pub fn build_node_archive_with_ids(nodes: &[(f64, f64, u64)]) -> Osm {
     ids.set_ways(&fwd).unwrap();
     ids.set_relations(&fwd).unwrap();
 
-    // Remaining parent resources required to open the archive.
-    builder
-        .set_ways(&[unsafe { Way::new_unchecked() }])
-        .unwrap();
-    builder
-        .set_relations(&[unsafe { Relation::new_unchecked() }])
-        .unwrap();
+    // Empty ways / relations, built via grow() of just the range-overlap
+    // sentinel (len 0). NB: `set_ways(&[])` would crash -- `as_bytes` for a
+    // `@range` (overlapping) struct reads one element past the slice base, and
+    // an empty slice's base pointer is dangling. `nodes_index` is not
+    // overlapping, so an empty `set_` is fine there.
+    {
+        let mut w = builder.start_ways().unwrap();
+        w.grow().unwrap();
+        w.close().unwrap();
+    }
+    {
+        let mut r = builder.start_relations().unwrap();
+        r.grow().unwrap();
+        r.close().unwrap();
+    }
     builder.set_nodes_index(&[]).unwrap();
     builder.start_relation_members().unwrap().close().unwrap();
     builder.set_tags(&[]).unwrap();
