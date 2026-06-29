@@ -111,6 +111,7 @@ pub fn serialize_dense_node_blocks(
     builder: &osmflat::OsmBuilder,
     granularity: i32,
     mut node_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
+    node_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     db: &DB,
     blocks: Vec<BlockIndex>,
     data: &[u8],
@@ -220,6 +221,19 @@ pub fn serialize_dense_node_blocks(
     if let Some(ids) = node_ids {
         ids.close()?;
     }
+
+    // Reverse index: `NodeIdToIdx` is keyed by OSM id (big-endian), so iterating
+    // it yields `(id, final_idx)` in ascending-id order. Emitting just the
+    // index gives a permutation `p` with `ids.nodes[p[k]]` ascending by id --
+    // exactly what the query side binary-searches.
+    if let Some(mut by_id) = node_by_id {
+        for r in <DB as RocksDB>::iterator::<NodeIdToIdxTDC>(db)? {
+            let (_id, idx) = r?;
+            by_id.grow()?.set_value(idx.idx);
+        }
+        by_id.close()?;
+    }
+
     info!("Dense nodes converted.");
     Ok(())
 }

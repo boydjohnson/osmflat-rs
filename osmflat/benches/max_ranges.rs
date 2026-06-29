@@ -66,7 +66,9 @@ fn bench_relations(c: &mut Criterion) {
         let mut group = c.benchmark_group(format!("relations_max_ranges@frac={frac}"));
         for cap in CAPS {
             group.bench_with_input(BenchmarkId::from_parameter(label(cap)), &cap, |b, &cap| {
-                b.iter(|| find_relations_by_bounding_box_capped(&archive, x0, y0, x1, y1, cap).count())
+                b.iter(|| {
+                    find_relations_by_bounding_box_capped(&archive, x0, y0, x1, y1, cap).count()
+                })
             });
         }
         group.finish();

@@ -118,6 +118,7 @@ pub fn serialize_way_blocks(
     builder: &osmflat::OsmBuilder,
     db: &DB,
     mut way_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
+    way_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     blocks: Vec<BlockIndex>,
     data: &[u8],
     tags: &mut TagSerializer,
@@ -265,6 +266,19 @@ pub fn serialize_way_blocks(
         ids.close()?;
     }
     nodes_index.close()?;
+
+    // Reverse index: `WayIdToIdx` is keyed by OSM id (big-endian), so iterating
+    // it yields `(id, final_idx)` in ascending-id order. Emitting just the index
+    // gives a permutation `p` with `ids.ways[p[k]]` ascending by id, which the
+    // query side binary-searches. See the node path for the rationale.
+    if let Some(mut by_id) = way_by_id {
+        for r in <DB as RocksDB>::iterator::<WayIdToIdxTDC>(db)? {
+            let (_id, idx) = r?;
+            by_id.grow()?.set_value(idx.idx);
+        }
+        by_id.close()?;
+    }
+
     info!("Ways processed");
     Ok(())
 }

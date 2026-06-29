@@ -175,21 +175,34 @@ pub fn run(args: Args) -> Result<(), Error> {
     let mut stats = Stats::default();
     let mut missing = MissingRefs::default();
 
+    // The reverse id index indirects through the positional id vectors, so it
+    // requires the forward `--ids` data; `--reverse-ids` therefore implies it.
+    let want_ids = args.ids || args.reverse_ids;
+
     let ids_archive;
     let mut node_ids = None;
     let mut way_ids = None;
     let mut relation_ids = None;
-    if args.ids {
+    let mut node_by_id = None;
+    let mut way_by_id = None;
+    let mut relation_by_id = None;
+    if want_ids {
         ids_archive = builder.ids()?;
         node_ids = Some(ids_archive.start_nodes()?);
         way_ids = Some(ids_archive.start_ways()?);
         relation_ids = Some(ids_archive.start_relations()?);
+        if args.reverse_ids {
+            node_by_id = Some(ids_archive.start_nodes_by_id()?);
+            way_by_id = Some(ids_archive.start_ways_by_id()?);
+            relation_by_id = Some(ids_archive.start_relations_by_id()?);
+        }
     }
 
     serialize_dense_node_blocks(
         &builder,
         greatest_common_granularity,
         node_ids,
+        node_by_id,
         &db,
         pbf_dense_nodes,
         &input_data,
@@ -203,6 +216,7 @@ pub fn run(args: Args) -> Result<(), Error> {
         &builder,
         &db,
         way_ids,
+        way_by_id,
         pbf_ways,
         &input_data,
         &mut tags,
@@ -216,6 +230,7 @@ pub fn run(args: Args) -> Result<(), Error> {
         &builder,
         &db,
         relation_ids,
+        relation_by_id,
         pbf_relations,
         &input_data,
         &mut tags,

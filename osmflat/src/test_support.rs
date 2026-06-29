@@ -143,6 +143,91 @@ pub fn build_archive(
     Osm::open(storage).unwrap()
 }
 
+/// Build a node-only archive that also carries the optional `ids` sub-archive
+/// with both the forward (index -> id) vectors and the reverse (id -> index)
+/// permutation, laid out exactly as `osmflatc --reverse-ids` writes them: nodes
+/// in z-order, `ids.nodes` parallel to that order, and `ids.nodes_by_id` a
+/// permutation ordered so `ids.nodes[nodes_by_id[k]]` ascends by id.
+///
+/// `nodes` is `(lon, lat, osm_id)` per node. Used to exercise the id<->index
+/// lookups in [`crate::ids`].
+pub fn build_node_archive_with_ids(nodes: &[(f64, f64, u64)]) -> Osm {
+    use crate::{Id, IdxRef};
+
+    let storage = MemoryResourceStorage::new("/test-ids");
+    let builder = OsmBuilder::new(storage.clone()).unwrap();
+
+    let mut header = Header::new();
+    header.set_coord_scale(COORD_SCALE);
+    builder.set_header(&header).unwrap();
+
+    // Nodes in z-order (the order osmflatc emits, recovered here by sorting).
+    let curve = node_curve();
+    let mut order: Vec<usize> = (0..nodes.len()).collect();
+    order.sort_by_key(|&i| node_index(&curve, nodes[i].0, nodes[i].1));
+
+    let mut node_vec: Vec<Node> = order
+        .iter()
+        .map(|&orig| {
+            let (lon, lat, _) = nodes[orig];
+            let mut n = unsafe { Node::new_unchecked() };
+            n.set_lon(scale(lon));
+            n.set_lat(scale(lat));
+            n.set_tag_first_idx(0);
+            n
+        })
+        .collect();
+    node_vec.push(unsafe { Node::new_unchecked() }); // sentinel, no id
+    builder.set_nodes(&node_vec).unwrap();
+
+    let ids = builder.ids().unwrap();
+
+    // Forward: ids.nodes[i] is the id of the node at spatial index i.
+    let mut fwd: Vec<Id> = order
+        .iter()
+        .map(|&orig| {
+            let mut e = Id::new();
+            e.set_value(nodes[orig].2);
+            e
+        })
+        .collect();
+    ids.set_nodes(&fwd).unwrap();
+
+    // Reverse: permutation of spatial indices ordered by ascending id.
+    let mut perm: Vec<u64> = (0..order.len() as u64).collect();
+    perm.sort_by_key(|&spatial_idx| fwd[spatial_idx as usize].value());
+    let by_id: Vec<IdxRef> = perm
+        .iter()
+        .map(|&spatial_idx| {
+            let mut e = IdxRef::new();
+            e.set_value(spatial_idx);
+            e
+        })
+        .collect();
+    ids.set_nodes_by_id(&by_id).unwrap();
+
+    // Ways/relations are empty here but their forward id vectors must exist for
+    // the sub-archive to open.
+    fwd.clear();
+    ids.set_ways(&fwd).unwrap();
+    ids.set_relations(&fwd).unwrap();
+
+    // Remaining parent resources required to open the archive.
+    builder
+        .set_ways(&[unsafe { Way::new_unchecked() }])
+        .unwrap();
+    builder
+        .set_relations(&[unsafe { Relation::new_unchecked() }])
+        .unwrap();
+    builder.set_nodes_index(&[]).unwrap();
+    builder.start_relation_members().unwrap().close().unwrap();
+    builder.set_tags(&[]).unwrap();
+    builder.set_tags_index(&[]).unwrap();
+    builder.set_stringtable(b"\0").unwrap();
+
+    Osm::open(storage).unwrap()
+}
+
 /// Small deterministic RNG (SplitMix64) used by the synthetic-archive
 /// generators so benchmark runs are reproducible from their seed.
 struct Rng(u64);

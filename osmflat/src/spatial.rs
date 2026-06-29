@@ -155,13 +155,13 @@ fn partition_point_by(len: usize, mut pred: impl FnMut(usize) -> bool) -> usize 
 /// Correctness is unaffected either way — coverage is preserved.
 ///
 /// `Some(64)` is the sweet spot of the `max_ranges` bench (the `ranges()` alloc
-/// is the profiled hotspot). The optimum cap grows with query-box size, so 64 is
-/// chosen to balance across box sizes: near-optimal on tight/medium boxes (the
-/// common case — ways ~130/180 µs, relations ~95/100 µs) with a bounded worst
-/// case on wide boxes (ways ~520 µs, relations ~160 µs). That worst case is still
-/// ~44×/114× faster than `None`, whose cost explodes with box size (ways reach
-/// ~23 ms on a wide box). `Some(8)` is uniformly worse — too coarse, it
-/// over-selects a huge candidate set.
+/// is the profiled hotspot). The optimum cap grows with query-box size, so 64
+/// is chosen to balance across box sizes: near-optimal on tight/medium boxes
+/// (the common case — ways ~130/180 µs, relations ~95/100 µs) with a bounded
+/// worst case on wide boxes (ways ~520 µs, relations ~160 µs). That worst case
+/// is still ~44×/114× faster than `None`, whose cost explodes with box size
+/// (ways reach ~23 ms on a wide box). `Some(8)` is uniformly worse — too
+/// coarse, it over-selects a huge candidate set.
 const BBOX_QUERY_MAX_RANGES: Option<u16> = Some(64);
 
 /// Return [Way]s that are in the archive and inside the bounding box.
@@ -454,7 +454,9 @@ mod tests {
 
             let nw = ways.ways().len().saturating_sub(1);
             let bf_w = (0..nw)
-                .filter(|&i| way_bounding_box(&ways, i, cs).is_some_and(|(a, b, c, d)| overlaps(a, b, c, d)))
+                .filter(|&i| {
+                    way_bounding_box(&ways, i, cs).is_some_and(|(a, b, c, d)| overlaps(a, b, c, d))
+                })
                 .count();
             let nr = rels.relations().len().saturating_sub(1);
             let bf_r = rels.relations()[..nr]

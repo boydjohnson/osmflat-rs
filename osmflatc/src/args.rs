@@ -20,6 +20,11 @@ pub struct Args {
     #[arg(long = "ids")]
     pub ids: bool,
 
+    /// Also write the reverse id index (OSM id -> archive index) for fast
+    /// id-based lookups. Implies `--ids`.
+    #[arg(long = "reverse-ids")]
+    pub reverse_ids: bool,
+
     /// Scratch RocksDB directory; use a fast SSD with ample space [default:
     /// output's parent]
     #[arg(long = "scratch-dir")]

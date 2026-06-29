@@ -303,6 +303,7 @@ pub fn serialize_relation_blocks(
     builder: &osmflat::OsmBuilder,
     db: &DB,
     mut relation_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
+    relation_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     blocks: Vec<BlockIndex>,
     data: &[u8],
     tags: &mut TagSerializer,
@@ -421,6 +422,20 @@ pub fn serialize_relation_blocks(
         ids.close()?;
     }
     relation_members.close()?;
+
+    // Reverse index: unlike nodes/ways there is no id-keyed RocksDB CF for
+    // relations -- `relation_id_to_idx` is an in-memory map (id -> final idx).
+    // Relations are few (~tens of millions even at planet scale), so sort the
+    // pairs by id and emit the indices: `ids.relations[p[k]]` then ascends by
+    // id, matching the query-side binary search.
+    if let Some(mut by_id) = relation_by_id {
+        let mut pairs: Vec<(i64, u64)> = relation_id_to_idx.into_iter().collect();
+        pairs.sort_unstable_by_key(|&(id, _)| id);
+        for (_id, idx) in pairs {
+            by_id.grow()?.set_value(idx);
+        }
+        by_id.close()?;
+    }
 
     pb.finish();
     info!("Relations converted.");
