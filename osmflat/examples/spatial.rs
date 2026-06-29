@@ -14,6 +14,7 @@ enum OsmType {
 
 /// Queries an osmflat archive by bounding box
 #[derive(Debug, Parser)]
+#[command(allow_negative_numbers = true)]
 struct Args {
     /// input osmflat archive
     input: PathBuf,
