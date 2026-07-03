@@ -1,4 +1,4 @@
-use super::{write_batch_no_wal, WriteBatchInternal};
+use super::{finalize_bulk_cfs, write_batch_no_wal, WriteBatchInternal};
 use crate::error::OsmFlatcError;
 use crate::{
     add_string_table,
@@ -170,6 +170,11 @@ pub fn serialize_way_blocks(
     pb.finish();
     info!("Ways converted.");
 
+    // Write->read boundary: the spatial-order scan below reads `WayTDC`, and
+    // the relation pass point-looks-up `WayIdToMbb`.
+    info!("Compacting way column families...");
+    finalize_bulk_cfs(db, &[WayTDC::NAME, WayIdToMbbTDC::NAME])?;
+
     let mut batch = WriteBatchInternal::default();
     let cf = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
     batch.insert_cf(WayIdToIdxTDC::NAME, cf);
@@ -255,6 +260,11 @@ pub fn serialize_way_blocks(
     write_batch_no_wal(db, batch.inner())?;
 
     pb.finish();
+
+    // Write->read boundary: the reverse-id scan below and the relation pass
+    // read `WayIdToIdx`.
+    info!("Compacting way id->idx column family...");
+    finalize_bulk_cfs(db, &[WayIdToIdxTDC::NAME])?;
 
     {
         let sentinel = ways.grow()?;

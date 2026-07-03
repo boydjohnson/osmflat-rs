@@ -3,7 +3,8 @@ use crate::processing::storage::OsmIdKey;
 use crate::processing::storage::OsmIdxValue;
 use crate::processing::storage::OsmKey;
 use crate::processing::{
-    write_batch_no_wal, RocksDB, RocksDBUnsync, TempDataCodec, WriteBatchInternal,
+    finalize_bulk_cfs, write_batch_no_wal, RocksDB, RocksDBUnsync, TempDataCodec,
+    WriteBatchInternal,
 };
 use crate::{
     add_string_table,
@@ -164,6 +165,11 @@ pub fn serialize_dense_node_blocks(
     *stringtable = string_table.into_inner();
     pb.finish();
 
+    // Write->read boundary: the spatial-order scan below reads `NodesTDC`, and
+    // the way/relation passes point-look-up `NodeIdToLonLat`.
+    info!("Compacting node column families...");
+    finalize_bulk_cfs(db, &[NodesTDC::NAME, NodeIdToLonLatTDC::NAME])?;
+
     let pb = ProgressBar::new(stats.num_nodes as u64)
         .with_style(pb_style())
         .with_prefix("Ordering dense nodes in spatial index order");
@@ -213,6 +219,11 @@ pub fn serialize_dense_node_blocks(
 
     write_batch_no_wal(db, batch.inner())?;
     pb.finish();
+
+    // Write->read boundary: the reverse-id scan below and the way/relation
+    // passes read `NodeIdToIdx`.
+    info!("Compacting node id->idx column family...");
+    finalize_bulk_cfs(db, &[NodeIdToIdxTDC::NAME])?;
 
     // fill tag_first_idx of the sentry, since it contains the end of the tag range
     // of the last node

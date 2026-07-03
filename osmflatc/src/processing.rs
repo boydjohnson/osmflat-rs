@@ -3,8 +3,8 @@ use std::path::Path;
 
 use node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodesTDC};
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, Env, IteratorMode, Options,
-    WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, Env,
+    IteratorMode, MemtableFactory, Options, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
 use way::storage::{WayIdToIdxTDC, WayIdToMbbTDC, WayTDC};
@@ -120,6 +120,42 @@ pub(crate) fn write_batch_no_wal(db: &DB, batch: WriteBatch) -> Result<(), rocks
     db.write_opt(batch, &opts)
 }
 
+/// Flush and manually compact column families at their write->read boundary.
+///
+/// The scratch DB runs in bulk-load mode (vector memtables, auto-compaction
+/// disabled -- see [`create_db`]), which makes writes cheap but leaves each
+/// column family as unsorted memtables plus a pile of overlapping L0 files.
+/// Reading in that state would be pathological (point lookups scan every
+/// unsorted memtable, iterators heap-merge across every L0 file), so every
+/// write pass must call this on the families it wrote before any pass reads
+/// them: one flush plus one full-range compaction yields a single sorted run,
+/// doing the sorting work once that the skiplist/auto-compaction path would
+/// have done continuously. Families compact in parallel, one thread each,
+/// on top of RocksDB's own subcompaction parallelism.
+pub(crate) fn finalize_bulk_cfs(db: &DB, cf_names: &[&str]) -> Result<(), rocksdb::Error> {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = cf_names
+            .iter()
+            .map(|name| {
+                s.spawn(move || -> Result<(), rocksdb::Error> {
+                    let cf = db.cf_handle(name).unwrap();
+                    db.flush_cf(cf)?;
+                    let mut opts = CompactOptions::default();
+                    // Let the per-family compactions overlap instead of
+                    // serializing on the manual-compaction exclusivity gate.
+                    opts.set_exclusive_manual_compaction(false);
+                    db.compact_range_cf_opt(cf, None::<&[u8]>, None::<&[u8]>, &opts);
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("finalize_bulk_cfs worker panicked")?;
+        }
+        Ok(())
+    })
+}
+
 /// Open the temporary RocksDB used to sort entities into spatial order.
 ///
 /// The database lives in a freshly created temporary directory under
@@ -168,6 +204,25 @@ pub fn create_db(
     cf_opts.set_write_buffer_size(write_buffer_bytes);
     cf_opts.set_block_based_table_factory(&block_opts);
 
+    // Every column family follows a strict bulk-load lifecycle: one pass writes
+    // it completely, later passes only read it (see `finalize_bulk_cfs`, called
+    // at each write->read boundary). Profiling the node pass showed ~45% of all
+    // CPU inside skiplist memtable inserts, ordering work we can defer: a
+    // vector memtable turns every insert into a plain append and sorts once per
+    // flush instead. Reads against an unflushed/uncompacted vector memtable
+    // would be pathological, but the lifecycle guarantees none happen before
+    // `finalize_bulk_cfs` has flushed and compacted the family.
+    cf_opts.set_memtable_factory(MemtableFactory::Vector);
+    // Auto-compaction would repeatedly rewrite data we are only going to read
+    // after the (cheaper) single manual compaction at the end of the write
+    // pass. The L0 stall triggers exist to let auto-compaction catch up, so
+    // lift them out of reach too -- otherwise the accumulating L0 files from
+    // flushed memtables would stall the bulk writes they are meant to protect.
+    cf_opts.set_disable_auto_compactions(true);
+    cf_opts.set_level_zero_file_num_compaction_trigger(i32::MAX);
+    cf_opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
+    cf_opts.set_level_zero_stop_writes_trigger(i32::MAX);
+
     let cfs = [
         NodesTDC::NAME,
         NodeIdToLonLatTDC::NAME,
@@ -204,6 +259,11 @@ pub fn create_db(
     db_opts.create_if_missing(true);
     db_opts.set_max_background_jobs(flush_threads + compaction_threads);
     db_opts.set_max_subcompactions(4);
+    // Concurrent memtable writes are only supported by the skiplist memtable;
+    // with the vector memtable above, writers must take the write lock one
+    // group at a time (an append under the lock is cheap, unlike the skiplist
+    // insert this replaces).
+    db_opts.set_allow_concurrent_memtable_write(false);
     // By default RocksDB keeps a handle open for every SST file. On a large
     // ingest the scratch DB grows to thousands of SSTs across its column
     // families, which exhausts the process file-descriptor limit (the macOS

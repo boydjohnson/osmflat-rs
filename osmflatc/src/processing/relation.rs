@@ -4,6 +4,7 @@ use crate::{
     osmpbf::{self, read_block, BlockIndex, PrimitiveBlock},
     pb_style,
     processing::{
+        finalize_bulk_cfs,
         node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC},
         storage::{OsmIdKey, OsmKey},
         way::storage::{WayIdToIdxTDC, WayIdToMbbTDC},
@@ -359,6 +360,10 @@ pub fn serialize_relation_blocks(
         }
     }
     pb.finish();
+
+    // Write->read boundary: both ordered scans below read these families.
+    info!("Compacting relation column families...");
+    finalize_bulk_cfs(db, &[RELATIONS, RELATIONS_STRING_REFS])?;
 
     // First pass over the spatially-ordered relations: map each relation id to
     // its final index, so relation members can be resolved in the second pass
