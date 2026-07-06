@@ -5,9 +5,9 @@ use crate::{
     osmpbf::{self, read_block, BlockIndex},
     pb_style,
     processing::{
-        node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC},
+        node::storage::NodeIdToIdxTDC,
         storage::{OsmIdKey, OsmIdxValue, OsmKey},
-        RocksDB, RocksDBSync, RocksDBUnsync, TempDataCodec,
+        NodeLocations, RocksDB, RocksDBSync, RocksDBUnsync, TempDataCodec,
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
@@ -32,7 +32,7 @@ const ORDER_CHUNK: usize = 100_000;
 fn serialize_ways(
     block: &osmpbf::PrimitiveBlock,
     batch: &mut impl RocksDBUnsync,
-    db: &DB,
+    node_locations: &NodeLocations,
     stringtable: &Mutex<StringTable>,
     coord_scale: i32,
 ) -> Result<Stats, OsmFlatcError> {
@@ -60,7 +60,7 @@ fn serialize_ways(
                 ));
             }
 
-            let mut node_locations = vec![];
+            let mut locations = vec![];
             let mut node_refs = vec![];
             let mut ref_id = 0;
             for r in &pbf_way.refs {
@@ -68,17 +68,15 @@ fn serialize_ways(
 
                 node_refs.push(ref_id);
 
-                let node_id = OsmIdKey::new(ref_id);
-
-                if let Some(n) = <DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(db, &node_id)? {
-                    node_locations.push((
-                        n.lon as f64 / coord_scale as f64,
-                        n.lat as f64 / coord_scale as f64,
+                if let Some((lon, lat)) = node_locations.get(ref_id)? {
+                    locations.push((
+                        lon as f64 / coord_scale as f64,
+                        lat as f64 / coord_scale as f64,
                     ));
                 }
             }
 
-            let points: MultiPoint<_> = node_locations.into();
+            let points: MultiPoint<_> = locations.into();
 
             let mbr = points.bounding_rect();
             if let Some(br) = mbr {
@@ -117,6 +115,7 @@ fn serialize_ways(
 pub fn serialize_way_blocks(
     builder: &osmflat::OsmBuilder,
     db: &DB,
+    node_locations: &NodeLocations,
     mut way_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     way_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     blocks: Vec<BlockIndex>,
@@ -152,7 +151,8 @@ pub fn serialize_way_blocks(
                 batch.insert_cf(cf_name, cf);
             }
 
-            let block_stats = serialize_ways(&block, &mut batch, db, &string_table, coord_scale)?;
+            let block_stats =
+                serialize_ways(&block, &mut batch, node_locations, &string_table, coord_scale)?;
 
             write_batch_no_wal(db, batch.inner())?;
 

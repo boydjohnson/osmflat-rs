@@ -5,10 +5,11 @@
 //! `pub(crate)` rather than being forced public.
 
 use crate::args::Args;
+use crate::flat_nodes::FlatNodes;
 use crate::osmpbf::{self, build_block_index, read_block, BlockType};
 use crate::processing::{
     create_db, node::serialize_dense_node_blocks, relation::serialize_relation_blocks,
-    way::serialize_way_blocks,
+    way::serialize_way_blocks, NodeLocations,
 };
 use crate::stats::{MissingRefs, Stats};
 use crate::strings::StringTable;
@@ -147,9 +148,9 @@ pub fn run(args: Args) -> Result<(), Error> {
     serialize_header(&pbf_header, coord_scale, &builder, &mut stringtable)?;
     info!("Header written.");
 
-    // Keep `_scratch` alive for the whole conversion; dropping it removes the
+    // Keep `scratch` alive for the whole conversion; dropping it removes the
     // temporary RocksDB directory. `db` (declared here) is dropped before
-    // `_scratch`, closing the database before its files are deleted.
+    // `scratch`, closing the database before its files are deleted.
     //
     // The scratch DB is I/O-heavy and huge for a planet, so honor an explicit
     // `--scratch-dir` (point it at a fast SSD) and otherwise fall back to the
@@ -165,12 +166,26 @@ pub fn run(args: Args) -> Result<(), Error> {
     // open-file limit, which the caller raises with `ulimit -n` as needed.
     info!("RocksDB max_open_files: {}", args.max_open_files);
 
-    let (db, _scratch) = create_db(
+    let (db, scratch) = create_db(
         scratch_parent,
         args.block_cache_mb * 1024 * 1024,
         args.write_buffer_mb * 1024 * 1024,
         args.max_open_files,
     )?;
+
+    // With `--flat-nodes`, node locations bypass RocksDB entirely: a sparse
+    // mmap'd file in the scratch dir, one 8-byte slot per node id. The file is
+    // deleted together with the scratch dir.
+    let flat_nodes = if args.flat_nodes {
+        info!("Storing node locations in a flat sparse file (--flat-nodes)");
+        Some(FlatNodes::create(scratch.path())?)
+    } else {
+        None
+    };
+    let node_locations = match &flat_nodes {
+        Some(flat) => NodeLocations::Flat(flat),
+        None => NodeLocations::Rocks(&db),
+    };
 
     let mut stats = Stats::default();
     let mut missing = MissingRefs::default();
@@ -204,6 +219,7 @@ pub fn run(args: Args) -> Result<(), Error> {
         node_ids,
         node_by_id,
         &db,
+        flat_nodes.as_ref(),
         pbf_dense_nodes,
         &input_data,
         &mut tags,
@@ -215,6 +231,7 @@ pub fn run(args: Args) -> Result<(), Error> {
     serialize_way_blocks(
         &builder,
         &db,
+        &node_locations,
         way_ids,
         way_by_id,
         pbf_ways,
@@ -229,6 +246,7 @@ pub fn run(args: Args) -> Result<(), Error> {
     serialize_relation_blocks(
         &builder,
         &db,
+        &node_locations,
         relation_ids,
         relation_by_id,
         pbf_relations,

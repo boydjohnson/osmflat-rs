@@ -5,10 +5,10 @@ use crate::{
     pb_style,
     processing::{
         finalize_bulk_cfs,
-        node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC},
+        node::storage::NodeIdToIdxTDC,
         storage::{OsmIdKey, OsmKey},
         way::storage::{WayIdToIdxTDC, WayIdToMbbTDC},
-        Key, RocksDBSync, TempDataCodec,
+        Key, NodeLocations, RocksDBSync, TempDataCodec,
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
@@ -33,6 +33,7 @@ fn build_relations_index<I>(
     data: &[u8],
     block_index: I,
     db: &DB,
+    node_locations: &NodeLocations,
 ) -> Result<(AHashMap<i64, RelationInfo>, Vec<RelationInfo>), Error>
 where
     I: ExactSizeIterator<Item = BlockIndex> + Send + 'static,
@@ -70,16 +71,11 @@ where
 
                             match member_type.unwrap() {
                                 osmpbf::relation::MemberType::Node => {
-                                    let v = <DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(
-                                        db,
-                                        &OsmIdKey::new(memid),
-                                    )?;
-
                                     // Relation points are stored as (lon, lat) to match the
                                     // way-member bbox corners pushed below. Missing members are
                                     // counted later, in the emit pass, with osmium semantics.
-                                    if let Some(v) = v {
-                                        relation_info.points.push((v.lon, v.lat));
+                                    if let Some((lon, lat)) = node_locations.get(memid)? {
+                                        relation_info.points.push((lon, lat));
                                     }
                                 }
                                 osmpbf::relation::MemberType::Way => {
@@ -303,6 +299,7 @@ fn relation_spatial_index(curve: &XZ2SFC, mbb: [i32; 4], coord_scale: i32) -> u6
 pub fn serialize_relation_blocks(
     builder: &osmflat::OsmBuilder,
     db: &DB,
+    node_locations: &NodeLocations,
     mut relation_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     relation_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     blocks: Vec<BlockIndex>,
@@ -315,7 +312,8 @@ pub fn serialize_relation_blocks(
 ) -> Result<(), Error> {
     // We need to build the index of relation ids first, since relations can refer
     // again to relations.
-    let (found, unresolved) = build_relations_index(data, blocks.clone().into_iter(), db)?;
+    let (found, unresolved) =
+        build_relations_index(data, blocks.clone().into_iter(), db, node_locations)?;
     let found = resolve_all_relations(found, unresolved);
 
     let relations_cf = db.cf_handle(RELATIONS).unwrap();

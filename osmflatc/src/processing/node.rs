@@ -1,4 +1,5 @@
 use crate::error::OsmFlatcError;
+use crate::flat_nodes::FlatNodes;
 use crate::processing::storage::OsmIdKey;
 use crate::processing::storage::OsmIdxValue;
 use crate::processing::storage::OsmKey;
@@ -31,6 +32,7 @@ pub fn serialize_dense_nodes_primative_block(
     block: &osmpbf::PrimitiveBlock,
     granularity: i32,
     batch: &mut impl RocksDBUnsync,
+    flat_nodes: Option<&FlatNodes>,
     string_table: &Mutex<StringTable>,
     coord_scale: i32,
 ) -> Result<Stats, OsmFlatcError> {
@@ -96,9 +98,13 @@ pub fn serialize_dense_nodes_primative_block(
 
             batch.put::<NodesTDC>(key, value);
 
-            let key2 = OsmIdKey::new(id);
-            let value2 = NodeLonLatValue::new(lon_, lat_);
-            batch.put::<NodeIdToLonLatTDC>(key2, value2);
+            if let Some(flat) = flat_nodes {
+                flat.put(id, lon_, lat_)?;
+            } else {
+                let key2 = OsmIdKey::new(id);
+                let value2 = NodeLonLatValue::new(lon_, lat_);
+                batch.put::<NodeIdToLonLatTDC>(key2, value2);
+            }
         }
         assert_eq!(tags_offset, dense_nodes.keys_vals.len());
         stats.num_nodes += dense_nodes.id.len();
@@ -114,6 +120,7 @@ pub fn serialize_dense_node_blocks(
     mut node_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     node_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     db: &DB,
+    flat_nodes: Option<&FlatNodes>,
     blocks: Vec<BlockIndex>,
     data: &[u8],
     tags: &mut TagSerializer,
@@ -150,6 +157,7 @@ pub fn serialize_dense_node_blocks(
                 &block,
                 granularity,
                 &mut batch,
+                flat_nodes,
                 &string_table,
                 coord_scale,
             )?;
@@ -166,9 +174,15 @@ pub fn serialize_dense_node_blocks(
     pb.finish();
 
     // Write->read boundary: the spatial-order scan below reads `NodesTDC`, and
-    // the way/relation passes point-look-up `NodeIdToLonLat`.
+    // the way/relation passes point-look-up `NodeIdToLonLat` -- unless the
+    // locations went to the flat-nodes file, in which case that family is
+    // empty and needs no barrier.
     info!("Compacting node column families...");
-    finalize_bulk_cfs(db, &[NodesTDC::NAME, NodeIdToLonLatTDC::NAME])?;
+    if flat_nodes.is_some() {
+        finalize_bulk_cfs(db, &[NodesTDC::NAME])?;
+    } else {
+        finalize_bulk_cfs(db, &[NodesTDC::NAME, NodeIdToLonLatTDC::NAME])?;
+    }
 
     let pb = ProgressBar::new(stats.num_nodes as u64)
         .with_style(pb_style())
@@ -271,8 +285,14 @@ mod tests {
 
         let stringtable = Mutex::new(StringTable::default());
 
-        let stats =
-            serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000);
+        let stats = serialize_dense_nodes_primative_block(
+            &block,
+            100,
+            &mut batch,
+            None,
+            &stringtable,
+            1_000_000,
+        );
 
         assert!(stats.is_ok());
 
@@ -329,9 +349,15 @@ mod tests {
         let mut batch = MockRocksBatch::default();
         let stringtable = Mutex::new(StringTable::default());
 
-        let stats =
-            serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000)
-                .unwrap();
+        let stats = serialize_dense_nodes_primative_block(
+            &block,
+            100,
+            &mut batch,
+            None,
+            &stringtable,
+            1_000_000,
+        )
+        .unwrap();
 
         assert_eq!(stats.num_nodes, 3);
 

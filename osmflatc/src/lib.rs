@@ -15,6 +15,7 @@ use indicatif::ProgressStyle;
 
 pub mod args;
 pub mod error;
+pub mod flat_nodes;
 pub mod osmpbf;
 pub mod processing;
 mod run;

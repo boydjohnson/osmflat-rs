@@ -30,6 +30,14 @@ pub struct Args {
     #[arg(long = "scratch-dir")]
     pub scratch_dir: Option<PathBuf>,
 
+    /// Store node locations in a flat mmap'd file indexed by node id instead
+    /// of RocksDB. Much faster for planet-scale ingests (O(1) lookups, no LSM
+    /// read path), but the sparse file spans the whole node-id space, so it
+    /// wastes disk on small regional extracts. The file lives in the scratch
+    /// directory
+    #[arg(long = "flat-nodes")]
+    pub flat_nodes: bool,
+
     /// Scratch RocksDB block cache (MiB); raise (e.g. 8192) for planet-scale
     #[arg(long = "block-cache-mb", default_value_t = 512)]
     pub block_cache_mb: usize,

@@ -108,6 +108,27 @@ impl RocksDB for DB {
     }
 }
 
+/// Backend for the id -> (lon, lat) node-location lookups performed by the
+/// way and relation passes: the `NodeIdToLonLat` RocksDB column family by
+/// default, or the flat mmap'd file when `--flat-nodes` is active.
+pub enum NodeLocations<'a> {
+    Rocks(&'a DB),
+    Flat(&'a crate::flat_nodes::FlatNodes),
+}
+
+impl NodeLocations<'_> {
+    pub fn get(&self, id: i64) -> Result<Option<(i32, i32)>, OsmFlatcError> {
+        match self {
+            NodeLocations::Rocks(db) => Ok(<DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(
+                db,
+                &storage::OsmIdKey::new(id),
+            )?
+            .map(|v| (v.lon, v.lat))),
+            NodeLocations::Flat(flat) => Ok(flat.get(id)),
+        }
+    }
+}
+
 /// Write a batch to the scratch DB with the WAL disabled.
 ///
 /// The scratch DB is a throwaway temporary database, recreated from scratch on
