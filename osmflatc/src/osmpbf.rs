@@ -95,9 +95,12 @@ struct BlockIndexIterator<'a> {
     cursor: usize,
 }
 
+/// Framing of one blob: its `BlobHeader` type plus the payload location.
+/// Produced by the cheap sequential framing walk; the payload itself is not
+/// touched until the parallel classification pass.
 enum BlobInfo {
     Header(BlockIndex),
-    Unknown(usize, usize, Vec<u8>),
+    Unknown(usize, usize),
 }
 
 impl<'a> BlockIndexIterator<'a> {
@@ -120,9 +123,10 @@ impl<'a> BlockIndexIterator<'a> {
 
         let blob_start = self.cursor;
         let blob_len = blob_header.datasize as usize;
+        // Skip the payload -- only the framing is read in this pass.
+        self.cursor += blob_len;
 
         if blob_header.r#type == "OSMHeader" {
-            self.cursor += blob_len;
             Ok(BlobInfo::Header(BlockIndex {
                 block_type: BlockType::Header,
                 granularity: None,
@@ -130,12 +134,7 @@ impl<'a> BlockIndexIterator<'a> {
                 blob_len,
             }))
         } else if blob_header.r#type == "OSMData" {
-            // read blob
-            Ok(BlobInfo::Unknown(
-                blob_start,
-                blob_len,
-                self.read(blob_header.datasize as usize).to_vec(),
-            ))
+            Ok(BlobInfo::Unknown(blob_start, blob_len))
         } else {
             panic!("unknown blob type");
         }
@@ -159,7 +158,7 @@ pub fn read_block<T: prost::Message + Default>(
 ) -> Result<T, io::Error> {
     let blob = Blob::decode(&data[idx.blob_start..idx.blob_start + idx.blob_len])?;
 
-    let mut blob_buf = Vec::new();
+    let mut blob_buf = Vec::with_capacity(blob.raw_size.unwrap_or(0) as usize);
     let blob_data = if blob.raw.is_some() {
         blob.raw.as_ref().unwrap()
     } else if blob.zlib_data.is_some() {
@@ -180,11 +179,13 @@ pub fn read_block<T: prost::Message + Default>(
 fn blob_type_and_granularity_from_blob_info(
     blob_start: usize,
     blob_len: usize,
-    blob: Vec<u8>,
+    blob: &[u8],
 ) -> Result<BlockIndex, io::Error> {
-    let blob = Blob::decode(blob.as_slice())?;
+    let blob = Blob::decode(blob)?;
 
-    let mut blob_buf = Vec::new();
+    // `raw_size` is the exact decompressed length; reserving it up front
+    // avoids several realloc+copy rounds per blob in `read_to_end`.
+    let mut blob_buf = Vec::with_capacity(blob.raw_size.unwrap_or(0) as usize);
     let blob_data = if blob.raw.is_some() {
         // use raw bytes
         blob.raw.as_ref().unwrap()
@@ -192,7 +193,20 @@ fn blob_type_and_granularity_from_blob_info(
         // decompress zlib data
         let data: &Vec<u8> = blob.zlib_data.as_ref().unwrap();
         let mut decoder = ZlibDecoder::new(&data[..]);
-        decoder.read_to_end(&mut blob_buf)?;
+        decoder.read_to_end(&mut blob_buf).map_err(|e| {
+            // A valid zlib stream starts 0x78; anything else at this offset
+            // means bad framing or a corrupt file rather than decoder trouble.
+            let head: Vec<String> = data.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{e} (blob at file offset {blob_start}, len {blob_len}, \
+                     zlib_data len {}, first bytes [{}])",
+                    data.len(),
+                    head.join(" ")
+                ),
+            )
+        })?;
         &blob_buf
     } else {
         panic!("can only read raw or zlib compressed blob");
@@ -212,15 +226,33 @@ fn blob_type_and_granularity_from_blob_info(
 }
 
 pub fn build_block_index(pbf_data: &[u8]) -> Vec<BlockIndex> {
-    let mut result: Vec<BlockIndex> = BlockIndexIterator::new(pbf_data)
-        .par_bridge()
-        .filter_map(|blob| {
-            let block = match blob {
-                Ok(BlobInfo::Header(b)) => Ok(b),
-                Ok(BlobInfo::Unknown(start, len, blob)) => {
-                    blob_type_and_granularity_from_blob_info(start, len, blob)
-                }
-                Err(e) => Err(e),
+    // Classifying a blob requires inflating it (type and granularity live
+    // inside the compressed PrimitiveBlock), so on a planet file this pass
+    // decompresses the entire input. Split it in two so that cost
+    // parallelizes: a sequential framing walk that reads only blob headers
+    // (never payloads), then an indexed parallel pass in which every worker
+    // inflates blobs straight from the input mmap -- no single-producer
+    // copy bottleneck.
+    let framing: Vec<BlobInfo> = BlockIndexIterator::new(pbf_data)
+        .filter_map(|blob| match blob {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!("Skipping block due to error: {e}");
+                None
+            }
+        })
+        .collect();
+
+    let mut result: Vec<BlockIndex> = framing
+        .into_par_iter()
+        .filter_map(|info| {
+            let block = match info {
+                BlobInfo::Header(b) => Ok(b),
+                BlobInfo::Unknown(start, len) => blob_type_and_granularity_from_blob_info(
+                    start,
+                    len,
+                    &pbf_data[start..start + len],
+                ),
             };
             match block {
                 Ok(b) => Some(b),

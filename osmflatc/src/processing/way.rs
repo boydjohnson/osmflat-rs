@@ -151,8 +151,13 @@ pub fn serialize_way_blocks(
                 batch.insert_cf(cf_name, cf);
             }
 
-            let block_stats =
-                serialize_ways(&block, &mut batch, node_locations, &string_table, coord_scale)?;
+            let block_stats = serialize_ways(
+                &block,
+                &mut batch,
+                node_locations,
+                &string_table,
+                coord_scale,
+            )?;
 
             write_batch_no_wal(db, batch.inner())?;
 
