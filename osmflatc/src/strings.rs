@@ -2,7 +2,7 @@ use ahash::AHashMap;
 
 #[derive(Debug, Clone, Copy)]
 struct TerminatedStringPtr {
-    ptr: *const u8,
+    ptr: *const std::os::raw::c_char,
 }
 
 // We use this (unsafe) wrapper to get the most compact hashmap possible
@@ -14,7 +14,7 @@ impl TerminatedStringPtr {
     /// Requires the data pointed to to:
     /// * Be \0 terminated
     /// * Outlive TerminatedStringPtr
-    unsafe fn from_ptr(ptr: *const u8) -> Self {
+    unsafe fn from_ptr(ptr: *const std::os::raw::c_char) -> Self {
         Self { ptr }
     }
 
@@ -22,7 +22,7 @@ impl TerminatedStringPtr {
         // Safety:
         // If constructed properly from a 0-terminated string that outlives this
         // instance this is safe
-        unsafe { std::ffi::CStr::from_ptr(self.ptr as *const i8).to_bytes() }
+        unsafe { std::ffi::CStr::from_ptr(self.ptr as *const std::os::raw::c_char).to_bytes() }
     }
 }
 
@@ -109,7 +109,7 @@ impl StringTable {
             // from a str)
             let key: &str = std::str::from_utf8_unchecked(&buffer[pos..]);
             // safe since we make sure to never reallocate/free any buffer
-            let key_ptr = key.as_ptr();
+            let key_ptr = key.as_ptr() as *const std::os::raw::c_char;
             TerminatedStringPtr::from_ptr(key_ptr)
         };
         self.indexed_data.insert(key, idx);
