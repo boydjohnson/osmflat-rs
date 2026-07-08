@@ -7,3 +7,6 @@ resolver = "2"
 
 [patch.crates-io]
 osmflat = { path = "osmflat" }
+
+[profile.release]
+debug = true

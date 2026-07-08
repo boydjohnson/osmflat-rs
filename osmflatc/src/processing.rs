@@ -39,6 +39,14 @@ pub trait RocksDBUnsync {
 
 pub trait RocksDBSync {
     fn get<TDC: TempDataCodec>(&self, key: &TDC::Key) -> Result<Option<TDC::Value>, OsmFlatcError>;
+
+    /// Batched point lookup: one round trip into RocksDB for all `keys`
+    /// instead of one per key, sharing the bloom-filter/block-cache setup
+    /// cost across the whole batch. Order of the result matches `keys`.
+    fn multi_get<TDC: TempDataCodec>(
+        &self,
+        keys: &[TDC::Key],
+    ) -> Result<Vec<Option<TDC::Value>>, OsmFlatcError>;
 }
 
 #[derive(Default)]
@@ -84,6 +92,22 @@ impl RocksDBSync for DB {
         self.get_cf(cf, key.serialize())
             .map_err(OsmFlatcError::RocksDB)
             .map(|v| v.map(|b| TDC::Value::from(b.into())))
+    }
+
+    fn multi_get<TDC: TempDataCodec>(
+        &self,
+        keys: &[TDC::Key],
+    ) -> Result<Vec<Option<TDC::Value>>, OsmFlatcError> {
+        let cf = self.cf_handle(TDC::NAME).unwrap();
+        let serialized: Vec<Vec<u8>> = keys.iter().map(Key::serialize).collect();
+
+        self.batched_multi_get_cf(cf, &serialized, false)
+            .into_iter()
+            .map(|res| {
+                res.map_err(OsmFlatcError::RocksDB)
+                    .map(|opt| opt.map(|slice| TDC::Value::from(Box::<[u8]>::from(slice.as_ref()))))
+            })
+            .collect()
     }
 }
 

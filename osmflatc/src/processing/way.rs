@@ -207,19 +207,18 @@ pub fn serialize_way_blocks(
             break;
         }
 
-        // Parallel: resolve each way's node-id refs to final indices.
+        // Parallel: resolve each way's node-id refs to final indices. One
+        // batched multi_get per way instead of one RocksDB round trip per
+        // ref -- shares the bloom-filter/block-cache lookup cost across the
+        // way's whole ref list.
         let resolved: Vec<Vec<Option<u64>>> = chunk
             .par_iter()
             .map(|(_, v)| -> Result<Vec<Option<u64>>, OsmFlatcError> {
-                v.node_refs
-                    .iter()
-                    .map(|&n| {
-                        Ok(
-                            <DB as RocksDBSync>::get::<NodeIdToIdxTDC>(db, &OsmIdKey::new(n))?
-                                .map(|v| v.idx),
-                        )
-                    })
-                    .collect()
+                let keys: Vec<OsmIdKey> = v.node_refs.iter().map(|&n| OsmIdKey::new(n)).collect();
+                Ok(<DB as RocksDBSync>::multi_get::<NodeIdToIdxTDC>(db, &keys)?
+                    .into_iter()
+                    .map(|v| v.map(|v| v.idx))
+                    .collect())
             })
             .collect::<Result<Vec<_>, _>>()?;
 
