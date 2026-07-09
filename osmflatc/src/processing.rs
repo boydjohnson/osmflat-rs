@@ -222,14 +222,24 @@ pub fn create_db(
     write_buffer_bytes: usize,
     max_open_files: i32,
 ) -> Result<(DB, TempDir), Box<dyn std::error::Error>> {
-    /// Immutable memtables allowed to queue per column family before writes
-    /// stall. Kept modest so peak memory stays bounded; flush throughput (see
-    /// below) is what actually keeps the queue drained.
-    const MAX_WRITE_BUFFER_NUMBER: i32 = 4;
-
     let scratch = tempfile::Builder::new()
         .prefix(".osmflatc-scratch-")
         .tempdir_in(scratch_parent)?;
+
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // Immutable memtables allowed to queue per column family before writes
+    // stall. This is the real ceiling on *concurrent flush jobs* -- at most
+    // two column families are actively written during the node/way bulk-load
+    // passes (one in `--flat-nodes` mode), so `flush_threads` below can never
+    // be kept busier than roughly `max_write_buffer_number` per active CF.
+    // Scale it with cores so bigger machines can sustain more concurrent
+    // flushes, but cap it well below `flush_threads`: each unit costs
+    // `write_buffer_bytes` of peak memtable memory per column family, and
+    // this tool needs to stay usable on an 8GB laptop by default.
+    let max_write_buffer_number = cpus.clamp(2, 8) as i32;
 
     // The relation-index and ordering passes do huge numbers of random point
     // lookups against a planet-sized DB. Without a bloom filter every miss/hit
@@ -245,7 +255,7 @@ pub fn create_db(
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
 
     let mut cf_opts = Options::default();
-    cf_opts.set_max_write_buffer_number(MAX_WRITE_BUFFER_NUMBER);
+    cf_opts.set_max_write_buffer_number(max_write_buffer_number);
     cf_opts.set_write_buffer_size(write_buffer_bytes);
     cf_opts.set_block_based_table_factory(&block_opts);
 
@@ -287,12 +297,13 @@ pub fn create_db(
     // pending flush. RocksDB schedules flushes on the env's HIGH-priority pool
     // and compactions on the LOW pool, so size each pool explicitly (derived
     // from available cores) instead of relying on `increase_parallelism`, which
-    // grows only the compaction pool and leaves flushes single-threaded.
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let flush_threads = (cpus / 4).clamp(2, 4) as i32;
-    let compaction_threads = cpus.clamp(2, 16) as i32;
+    // grows only the compaction pool and leaves flushes single-threaded. Flush
+    // threads scale to all available cores rather than a fixed cap -- actual
+    // flush concurrency during the write pass is still bounded by
+    // `max_write_buffer_number` above, so this pool is sized to have headroom
+    // rather than to be the limiting factor.
+    let flush_threads = cpus.max(2) as i32;
+    let compaction_threads = cpus.max(2) as i32;
 
     let mut env = Env::new()?;
     env.set_high_priority_background_threads(flush_threads);
