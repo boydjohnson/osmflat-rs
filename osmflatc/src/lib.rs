@@ -9,9 +9,12 @@
 use std::collections::hash_map;
 use std::io;
 use std::str;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
-use indicatif::ProgressStyle;
+use indicatif::{ProgressBar, ProgressStyle};
+use log::info;
 
 pub mod args;
 pub mod error;
@@ -138,8 +141,66 @@ pub fn add_string_table(
 }
 
 /// Shared progress-bar style for the conversion stages.
-pub fn pb_style() -> ProgressStyle {
+fn pb_style() -> ProgressStyle {
     ProgressStyle::with_template("{prefix:>24} [{bar:23}] {pos}/{len}: {per_sec} {elapsed}/{eta}")
         .unwrap()
         .progress_chars("=> ")
+}
+
+/// Minimum time between `info!` progress lines emitted for a non-interactive
+/// output (see [`Progress`]).
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wraps an indicatif progress bar for the conversion stages.
+///
+/// indicatif draws to stderr but goes silent -- by design -- whenever stderr
+/// isn't a terminal, e.g. output piped to a log file, `nohup`, a systemd
+/// unit, or CI. Planet-scale conversions run unattended in exactly that
+/// setup and can take hours per phase, so when the bar is hidden this falls
+/// back to periodic `info!` lines instead of going dark.
+pub struct Progress {
+    pb: ProgressBar,
+    prefix: &'static str,
+    last_logged: Mutex<Instant>,
+}
+
+impl Progress {
+    pub fn new(len: u64, prefix: &'static str) -> Self {
+        let pb = ProgressBar::new(len)
+            .with_style(pb_style())
+            .with_prefix(prefix);
+        if pb.is_hidden() {
+            info!("{prefix}: 0/{len}");
+        }
+        Progress {
+            pb,
+            prefix,
+            last_logged: Mutex::new(Instant::now()),
+        }
+    }
+
+    pub fn inc(&self, delta: u64) {
+        self.pb.inc(delta);
+        if !self.pb.is_hidden() {
+            return;
+        }
+        let mut last_logged = self.last_logged.lock().unwrap();
+        if last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
+            *last_logged = Instant::now();
+            info!(
+                "{}: {}/{}",
+                self.prefix,
+                self.pb.position(),
+                self.pb.length().unwrap_or_default()
+            );
+        }
+    }
+
+    pub fn finish(&self) {
+        self.pb.finish();
+        if self.pb.is_hidden() {
+            let len = self.pb.length().unwrap_or_default();
+            info!("{}: {len}/{len} done", self.prefix);
+        }
+    }
 }

@@ -10,12 +10,10 @@ use crate::processing::{
 use crate::{
     add_string_table,
     osmpbf::{self, read_block, BlockIndex},
-    pb_style,
     stats::Stats,
     strings::StringTable,
-    Error, TagSerializer, BATCH_SIZE,
+    Error, Progress, TagSerializer, BATCH_SIZE,
 };
-use indicatif::ProgressBar;
 use log::info;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -129,9 +127,7 @@ pub fn serialize_dense_node_blocks(
     coord_scale: i32,
 ) -> Result<(), Error> {
     let mut nodes = builder.start_nodes()?;
-    let pb = ProgressBar::new(blocks.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Converting dense nodes");
+    let pb = Progress::new(blocks.len() as u64, "Converting dense nodes");
 
     // Serialization (spatial-curve indexing + value encoding + the RocksDB
     // writes) dominates this pass, so fan it out across all Rayon workers. The
@@ -184,9 +180,10 @@ pub fn serialize_dense_node_blocks(
         finalize_bulk_cfs(db, &[NodesTDC::NAME, NodeIdToLonLatTDC::NAME])?;
     }
 
-    let pb = ProgressBar::new(stats.num_nodes as u64)
-        .with_style(pb_style())
-        .with_prefix("Ordering dense nodes in spatial index order");
+    let pb = Progress::new(
+        stats.num_nodes as u64,
+        "Ordering dense nodes in spatial index order",
+    );
 
     let mut batch = WriteBatchInternal::default();
 

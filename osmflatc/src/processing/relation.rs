@@ -2,7 +2,6 @@ use crate::error::OsmFlatcError;
 use crate::{
     add_string_table,
     osmpbf::{self, read_block, BlockIndex, PrimitiveBlock},
-    pb_style,
     processing::{
         finalize_bulk_cfs,
         node::storage::NodeIdToIdxTDC,
@@ -12,11 +11,10 @@ use crate::{
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
-    Error, TagSerializer,
+    Error, Progress, TagSerializer,
 };
 use ahash::AHashMap;
 use geo::{BoundingRect, MultiPoint};
-use indicatif::ProgressBar;
 use log::info;
 use prost::Message;
 use rayon::iter::{ParallelBridge, ParallelIterator};
@@ -38,9 +36,7 @@ fn build_relations_index<I>(
 where
     I: ExactSizeIterator<Item = BlockIndex> + Send + 'static,
 {
-    let pb = ProgressBar::new(block_index.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Building relations index");
+    let pb = Progress::new(block_index.len() as u64, "Building relations index");
 
     // The per-member RocksDB lookups dominate this pass and are random reads
     // against a planet-sized DB, so fan them out across all Rayon workers and
@@ -321,9 +317,7 @@ pub fn serialize_relation_blocks(
 
     let curve = osmflat::way_curve();
 
-    let pb = ProgressBar::new(blocks.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Converting relations");
+    let pb = Progress::new(blocks.len() as u64, "Converting relations");
 
     // Store every relation, keyed by its spatial index, so iterating the column
     // family yields spatial order. Relations with no resolvable member geometry
@@ -378,9 +372,7 @@ pub fn serialize_relation_blocks(
     let mut relations = builder.start_relations()?;
     let mut relation_members = builder.start_relation_members()?;
 
-    let pb = ProgressBar::new(relation_id_to_idx.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Ordering relations");
+    let pb = Progress::new(relation_id_to_idx.len() as u64, "Ordering relations");
 
     // Second pass: write the relations in spatial order, resolving members.
     for res in db

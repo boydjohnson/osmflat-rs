@@ -3,7 +3,6 @@ use crate::error::OsmFlatcError;
 use crate::{
     add_string_table,
     osmpbf::{self, read_block, BlockIndex},
-    pb_style,
     processing::{
         node::storage::NodeIdToIdxTDC,
         storage::{OsmIdKey, OsmIdxValue, OsmKey},
@@ -11,10 +10,9 @@ use crate::{
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
-    Error, TagSerializer, BATCH_SIZE,
+    Error, Progress, TagSerializer, BATCH_SIZE,
 };
 use geo::{BoundingRect, MultiPoint};
-use indicatif::ProgressBar;
 use log::info;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -127,9 +125,7 @@ pub fn serialize_way_blocks(
     coord_scale: i32,
 ) -> Result<(), Error> {
     let mut ways = builder.start_ways()?;
-    let pb = ProgressBar::new(blocks.len() as u64)
-        .with_style(pb_style())
-        .with_prefix("Converting ways");
+    let pb = Progress::new(blocks.len() as u64, "Converting ways");
     let mut nodes_index = builder.start_nodes_index()?;
 
     // The per-member RocksDB node-location lookups dominate this pass, so fan it
@@ -184,9 +180,10 @@ pub fn serialize_way_blocks(
     let cf = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
     batch.insert_cf(WayIdToIdxTDC::NAME, cf);
 
-    let pb = ProgressBar::new(stats.num_ways as u64)
-        .with_style(pb_style())
-        .with_prefix("Ordering ways by spatial index order");
+    let pb = Progress::new(
+        stats.num_ways as u64,
+        "Ordering ways by spatial index order",
+    );
 
     // The per-ref `NodeIdToIdx` lookups are random reads against the big node CF
     // and dominate this pass, but the flatdata writes (`ways`, `nodes_index`,
