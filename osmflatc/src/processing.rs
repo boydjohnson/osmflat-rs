@@ -4,7 +4,7 @@ use std::path::Path;
 use node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodesTDC};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, Env,
-    IteratorMode, MemtableFactory, Options, WriteBatch, WriteOptions, DB,
+    IteratorMode, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
 use way::storage::{WayIdToIdxTDC, WayIdToMbbTDC, WayTDC};
@@ -18,6 +18,12 @@ pub mod node;
 pub mod relation;
 pub(crate) mod storage;
 pub mod way;
+
+/// Forward readahead window for full column-family scans (see
+/// `RocksDB::iterator`). Sized in the low single-digit MB per RocksDB's own
+/// tuning guidance for sequential scans -- large enough to keep an NVMe's
+/// read pipeline full, small enough to not matter on an 8GB laptop.
+const READAHEAD_BYTES: usize = 4 * 1024 * 1024;
 
 pub trait Key: From<Box<[u8]>> {
     fn serialize(&self) -> Vec<u8>;
@@ -124,7 +130,16 @@ impl RocksDB for DB {
     {
         let cf = self.cf_handle(TDC::NAME).unwrap();
 
-        let iter = self.iterator_cf(cf, IteratorMode::Start);
+        // This drives the ordering passes' full column-family scans. With the
+        // default `ReadOptions` (readahead disabled) every block is a
+        // synchronous fetch at queue depth 1 -- on fast NVMe that leaves most
+        // of the drive's IOPS/bandwidth unused and the process CPU-idle,
+        // since nothing overlaps the reads. A forward readahead window lets
+        // RocksDB prefetch ahead of the iterator instead.
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_readahead_size(READAHEAD_BYTES);
+
+        let iter = self.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
         Ok(Box::new(iter.map(|res| {
             res.map_err(OsmFlatcError::RocksDB)
                 .map(|(k, v)| (TDC::Key::from(k), TDC::Value::from(v)))
