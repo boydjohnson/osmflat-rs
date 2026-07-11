@@ -199,12 +199,25 @@ pub(crate) fn finalize_bulk_cfs(db: &DB, cf_names: &[&str]) -> Result<(), rocksd
             .map(|name| {
                 s.spawn(move || -> Result<(), rocksdb::Error> {
                     let cf = db.cf_handle(name).unwrap();
+
+                    let t0 = std::time::Instant::now();
                     db.flush_cf(cf)?;
+                    log::debug!(
+                        "[timing] phase=\"flush_cf({name})\" secs={:.3}",
+                        t0.elapsed().as_secs_f64()
+                    );
+
+                    let t1 = std::time::Instant::now();
                     let mut opts = CompactOptions::default();
                     // Let the per-family compactions overlap instead of
                     // serializing on the manual-compaction exclusivity gate.
                     opts.set_exclusive_manual_compaction(false);
                     db.compact_range_cf_opt(cf, None::<&[u8]>, None::<&[u8]>, &opts);
+                    log::debug!(
+                        "[timing] phase=\"compact_cf({name})\" secs={:.3}",
+                        t1.elapsed().as_secs_f64()
+                    );
+
                     Ok(())
                 })
             })

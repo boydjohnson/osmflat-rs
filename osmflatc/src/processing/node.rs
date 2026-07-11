@@ -12,7 +12,7 @@ use crate::{
     osmpbf::{self, read_block, BlockIndex},
     stats::Stats,
     strings::StringTable,
-    Error, Progress, TagSerializer, BATCH_SIZE,
+    Error, PhaseTimer, Progress, TagSerializer, BATCH_SIZE,
 };
 use log::info;
 use parking_lot::Mutex;
@@ -137,34 +137,37 @@ pub fn serialize_dense_node_blocks(
     // recovered later by iterating RocksDB in sorted key order. `std::mem::take`
     // moves the caller's table in for the duration and it is restored below.
     let string_table = Mutex::new(std::mem::take(stringtable));
-    let total = blocks
-        .into_par_iter()
-        .map(|idx| -> Result<Stats, OsmFlatcError> {
-            let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
-            let mut batch = WriteBatchInternal::default();
+    let total = {
+        let _t = PhaseTimer::start("dense_nodes_convert");
+        blocks
+            .into_par_iter()
+            .map(|idx| -> Result<Stats, OsmFlatcError> {
+                let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
+                let mut batch = WriteBatchInternal::default();
 
-            for cf in [NodesTDC::NAME, NodeIdToLonLatTDC::NAME] {
-                if let Some(cf_handle) = db.cf_handle(cf) {
-                    batch.insert_cf(cf, cf_handle);
+                for cf in [NodesTDC::NAME, NodeIdToLonLatTDC::NAME] {
+                    if let Some(cf_handle) = db.cf_handle(cf) {
+                        batch.insert_cf(cf, cf_handle);
+                    }
                 }
-            }
 
-            let block_stats = serialize_dense_nodes_primative_block(
-                &block,
-                granularity,
-                &mut batch,
-                flat_nodes,
-                &string_table,
-                coord_scale,
-            )?;
-            write_batch_no_wal(db, batch.inner())?;
-            pb.inc(1);
-            Ok(block_stats)
-        })
-        .try_reduce(Stats::default, |mut a, b| {
-            a += b;
-            Ok(a)
-        })?;
+                let block_stats = serialize_dense_nodes_primative_block(
+                    &block,
+                    granularity,
+                    &mut batch,
+                    flat_nodes,
+                    &string_table,
+                    coord_scale,
+                )?;
+                write_batch_no_wal(db, batch.inner())?;
+                pb.inc(1);
+                Ok(block_stats)
+            })
+            .try_reduce(Stats::default, |mut a, b| {
+                a += b;
+                Ok(a)
+            })?
+    };
     *stats += total;
     *stringtable = string_table.into_inner();
     pb.finish();
@@ -190,45 +193,48 @@ pub fn serialize_dense_node_blocks(
     let cf = db.cf_handle(NodeIdToIdxTDC::NAME).unwrap();
     batch.insert_cf(NodeIdToIdxTDC::NAME, cf);
 
-    for (i, r) in <DB as RocksDB>::iterator::<NodesTDC>(db)?.enumerate() {
-        let (k, v) = r?;
+    {
+        let _t = PhaseTimer::start("dense_nodes_ordering");
+        for (i, r) in <DB as RocksDB>::iterator::<NodesTDC>(db)?.enumerate() {
+            let (k, v) = r?;
 
-        let idx = i as u64;
+            let idx = i as u64;
 
-        let node_id = OsmIdKey::new(k.id);
-        let node = nodes.grow()?;
-        // Coordinates travel inline in the NodesTDC value, so the previous
-        // per-node random `NodeIdToLonLat` lookup is gone -- this is now a pure
-        // sequential scan.
-        node.set_lon(v.lon);
-        node.set_lat(v.lat);
+            let node_id = OsmIdKey::new(k.id);
+            let node = nodes.grow()?;
+            // Coordinates travel inline in the NodesTDC value, so the previous
+            // per-node random `NodeIdToLonLat` lookup is gone -- this is now a pure
+            // sequential scan.
+            node.set_lon(v.lon);
+            node.set_lat(v.lat);
 
-        node.set_tag_first_idx(tags.next_index());
+            node.set_tag_first_idx(tags.next_index());
 
-        if !v.refs.is_empty() {
-            for &(key_ref, val_ref) in &v.refs {
-                tags.serialize(key_ref, val_ref)?;
+            if !v.refs.is_empty() {
+                for &(key_ref, val_ref) in &v.refs {
+                    tags.serialize(key_ref, val_ref)?;
+                }
+            }
+
+            if let Some(ids) = &mut node_ids {
+                ids.grow()?.set_value(k.id as u64);
+            }
+
+            let node_idx = OsmIdxValue::new(idx);
+
+            batch.put::<NodeIdToIdxTDC>(node_id, node_idx);
+            pb.inc(1);
+
+            if i % BATCH_SIZE == 0 {
+                write_batch_no_wal(db, batch.inner())?;
+                batch = WriteBatchInternal::default();
+                let cf = db.cf_handle(NodeIdToIdxTDC::NAME).unwrap();
+                batch.insert_cf(NodeIdToIdxTDC::NAME, cf);
             }
         }
 
-        if let Some(ids) = &mut node_ids {
-            ids.grow()?.set_value(k.id as u64);
-        }
-
-        let node_idx = OsmIdxValue::new(idx);
-
-        batch.put::<NodeIdToIdxTDC>(node_id, node_idx);
-        pb.inc(1);
-
-        if i % BATCH_SIZE == 0 {
-            write_batch_no_wal(db, batch.inner())?;
-            batch = WriteBatchInternal::default();
-            let cf = db.cf_handle(NodeIdToIdxTDC::NAME).unwrap();
-            batch.insert_cf(NodeIdToIdxTDC::NAME, cf);
-        }
+        write_batch_no_wal(db, batch.inner())?;
     }
-
-    write_batch_no_wal(db, batch.inner())?;
     pb.finish();
 
     // Write->read boundary: the reverse-id scan below and the way/relation

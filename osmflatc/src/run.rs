@@ -13,7 +13,7 @@ use crate::processing::{
 };
 use crate::stats::{MissingRefs, Stats};
 use crate::strings::StringTable;
-use crate::{Error, TagSerializer};
+use crate::{Error, PhaseTimer, TagSerializer};
 
 use flatdata::FileResourceStorage;
 use itertools::Itertools;
@@ -101,7 +101,10 @@ pub fn run(args: Args) -> Result<(), Error> {
     );
 
     info!("Building index of PBF blocks...");
-    let block_index = build_block_index(&input_data);
+    let block_index = {
+        let _t = PhaseTimer::start("build_block_index");
+        build_block_index(&input_data)
+    };
     let mut greatest_common_granularity = 1000000000;
     for block in &block_index {
         if block.block_type == BlockType::DenseNodes {
@@ -145,7 +148,10 @@ pub fn run(args: Args) -> Result<(), Error> {
     }
     let idx = &pbf_header[0];
     let pbf_header: osmpbf::HeaderBlock = read_block(&input_data, idx)?;
-    serialize_header(&pbf_header, coord_scale, &builder, &mut stringtable)?;
+    {
+        let _t = PhaseTimer::start("header_write");
+        serialize_header(&pbf_header, coord_scale, &builder, &mut stringtable)?;
+    }
     info!("Header written.");
 
     // Keep `scratch` alive for the whole conversion; dropping it removes the
@@ -166,12 +172,15 @@ pub fn run(args: Args) -> Result<(), Error> {
     // open-file limit, which the caller raises with `ulimit -n` as needed.
     info!("RocksDB max_open_files: {}", args.max_open_files);
 
-    let (db, scratch) = create_db(
-        scratch_parent,
-        args.block_cache_mb * 1024 * 1024,
-        args.write_buffer_mb * 1024 * 1024,
-        args.max_open_files,
-    )?;
+    let (db, scratch) = {
+        let _t = PhaseTimer::start("create_db");
+        create_db(
+            scratch_parent,
+            args.block_cache_mb * 1024 * 1024,
+            args.write_buffer_mb * 1024 * 1024,
+            args.max_open_files,
+        )?
+    };
 
     // With `--flat-nodes`, node locations bypass RocksDB entirely: a sparse
     // mmap'd file in the scratch dir, one 8-byte slot per node id. The file is
@@ -213,61 +222,76 @@ pub fn run(args: Args) -> Result<(), Error> {
         }
     }
 
-    serialize_dense_node_blocks(
-        &builder,
-        greatest_common_granularity,
-        node_ids,
-        node_by_id,
-        &db,
-        flat_nodes.as_ref(),
-        pbf_dense_nodes,
-        &input_data,
-        &mut tags,
-        &mut stringtable,
-        &mut stats,
-        coord_scale,
-    )?;
+    {
+        let _t = PhaseTimer::start("dense_nodes_total");
+        serialize_dense_node_blocks(
+            &builder,
+            greatest_common_granularity,
+            node_ids,
+            node_by_id,
+            &db,
+            flat_nodes.as_ref(),
+            pbf_dense_nodes,
+            &input_data,
+            &mut tags,
+            &mut stringtable,
+            &mut stats,
+            coord_scale,
+        )?;
+    }
 
-    serialize_way_blocks(
-        &builder,
-        &db,
-        &node_locations,
-        way_ids,
-        way_by_id,
-        pbf_ways,
-        &input_data,
-        &mut tags,
-        &mut stringtable,
-        &mut stats,
-        &mut missing,
-        coord_scale,
-    )?;
+    {
+        let _t = PhaseTimer::start("ways_total");
+        serialize_way_blocks(
+            &builder,
+            &db,
+            &node_locations,
+            way_ids,
+            way_by_id,
+            pbf_ways,
+            &input_data,
+            &mut tags,
+            &mut stringtable,
+            &mut stats,
+            &mut missing,
+            coord_scale,
+        )?;
+    }
 
-    serialize_relation_blocks(
-        &builder,
-        &db,
-        &node_locations,
-        relation_ids,
-        relation_by_id,
-        pbf_relations,
-        &input_data,
-        &mut tags,
-        &mut stringtable,
-        &mut stats,
-        &mut missing,
-        coord_scale,
-    )?;
+    {
+        let _t = PhaseTimer::start("relations_total");
+        serialize_relation_blocks(
+            &builder,
+            &db,
+            &node_locations,
+            relation_ids,
+            relation_by_id,
+            pbf_relations,
+            &input_data,
+            &mut tags,
+            &mut stringtable,
+            &mut stats,
+            &mut missing,
+            coord_scale,
+        )?;
+    }
 
     // Finalize data structures
     tags.close(); // drop the reference to stringtable
 
     info!("Writing stringtable to disk...");
-    builder.set_stringtable(&stringtable.into_bytes())?;
+    {
+        let _t = PhaseTimer::start("write_stringtable");
+        builder.set_stringtable(&stringtable.into_bytes())?;
+    }
 
     info!("osmflat archive built.");
 
     std::mem::drop(builder);
-    osmflat::Osm::open(storage)?;
+    {
+        let _t = PhaseTimer::start("verify_open");
+        osmflat::Osm::open(storage)?;
+    }
 
     info!("verified that osmflat archive can be opened.");
 

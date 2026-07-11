@@ -10,7 +10,7 @@ use crate::{
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
-    Error, Progress, TagSerializer, BATCH_SIZE,
+    Error, PhaseTimer, Progress, TagSerializer, BATCH_SIZE,
 };
 use geo::{BoundingRect, MultiPoint};
 use log::info;
@@ -136,35 +136,38 @@ pub fn serialize_way_blocks(
     // order. `std::mem::take` moves the caller's table in for the duration and
     // it is restored below.
     let string_table = Mutex::new(std::mem::take(stringtable));
-    let total = blocks
-        .into_par_iter()
-        .map(|idx| -> Result<Stats, OsmFlatcError> {
-            let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
+    let total = {
+        let _t = PhaseTimer::start("ways_convert");
+        blocks
+            .into_par_iter()
+            .map(|idx| -> Result<Stats, OsmFlatcError> {
+                let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
 
-            let mut batch = WriteBatchInternal::default();
-            for cf_name in [WayTDC::NAME, WayIdToMbbTDC::NAME] {
-                let cf = db.cf_handle(cf_name).unwrap();
-                batch.insert_cf(cf_name, cf);
-            }
+                let mut batch = WriteBatchInternal::default();
+                for cf_name in [WayTDC::NAME, WayIdToMbbTDC::NAME] {
+                    let cf = db.cf_handle(cf_name).unwrap();
+                    batch.insert_cf(cf_name, cf);
+                }
 
-            let block_stats = serialize_ways(
-                &block,
-                &mut batch,
-                node_locations,
-                &string_table,
-                coord_scale,
-            )?;
+                let block_stats = serialize_ways(
+                    &block,
+                    &mut batch,
+                    node_locations,
+                    &string_table,
+                    coord_scale,
+                )?;
 
-            write_batch_no_wal(db, batch.inner())?;
+                write_batch_no_wal(db, batch.inner())?;
 
-            pb.inc(1);
+                pb.inc(1);
 
-            Ok(block_stats)
-        })
-        .try_reduce(Stats::default, |mut a, b| {
-            a += b;
-            Ok(a)
-        })?;
+                Ok(block_stats)
+            })
+            .try_reduce(Stats::default, |mut a, b| {
+                a += b;
+                Ok(a)
+            })?
+    };
     *stats += total;
     *stringtable = string_table.into_inner();
 
@@ -194,6 +197,12 @@ pub fn serialize_way_blocks(
     // out across all Rayon workers; only the cheap, ordered appends run serially.
     let mut base: usize = 0;
     let mut iter = <DB as RocksDB>::iterator::<WayTDC>(db)?;
+    // Split the loop's two halves so the debug timing distinguishes a
+    // lookup-bound pass (`resolve_secs` dominates) from a write-bound one
+    // (`write_secs` dominates) -- see the comment above on why the pass is
+    // structured as parallel-resolve-then-sequential-write.
+    let mut resolve_secs = 0.0_f64;
+    let mut write_secs = 0.0_f64;
     loop {
         let mut chunk: Vec<(i64, WayValue)> = Vec::with_capacity(ORDER_CHUNK);
         for r in iter.by_ref().take(ORDER_CHUNK) {
@@ -208,6 +217,7 @@ pub fn serialize_way_blocks(
         // batched multi_get per way instead of one RocksDB round trip per
         // ref -- shares the bloom-filter/block-cache lookup cost across the
         // way's whole ref list.
+        let t0 = std::time::Instant::now();
         let resolved: Vec<Vec<Option<u64>>> = chunk
             .par_iter()
             .map(|(_, v)| -> Result<Vec<Option<u64>>, OsmFlatcError> {
@@ -218,8 +228,10 @@ pub fn serialize_way_blocks(
                     .collect())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        resolve_secs += t0.elapsed().as_secs_f64();
 
         // Sequential: write the chunk in spatial-iteration order.
+        let t1 = std::time::Instant::now();
         for (j, ((way_id, v), resolved_refs)) in chunk.iter().zip(resolved).enumerate() {
             let way = ways.grow()?;
 
@@ -254,9 +266,12 @@ pub fn serialize_way_blocks(
                 batch.insert_cf(WayIdToIdxTDC::NAME, cf);
             }
         }
+        write_secs += t1.elapsed().as_secs_f64();
 
         base += chunk.len();
     }
+    log::debug!("[timing] phase=\"ways_ordering_resolve\" secs={resolve_secs:.3}");
+    log::debug!("[timing] phase=\"ways_ordering_write\" secs={write_secs:.3}");
 
     write_batch_no_wal(db, batch.inner())?;
 

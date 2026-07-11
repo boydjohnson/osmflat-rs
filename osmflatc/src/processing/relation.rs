@@ -11,7 +11,7 @@ use crate::{
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
-    Error, Progress, TagSerializer,
+    Error, PhaseTimer, Progress, TagSerializer,
 };
 use ahash::AHashMap;
 use geo::{BoundingRect, MultiPoint};
@@ -21,6 +21,7 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use rocksdb::DB;
 use space_time::xzorder::xz2_sfc::XZ2SFC;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use storage::{
     break_relation_values, create_relation_values, RelationInfo, RELATIONS, RELATIONS_STRING_REFS,
 };
@@ -36,6 +37,7 @@ fn build_relations_index<I>(
 where
     I: ExactSizeIterator<Item = BlockIndex> + Send + 'static,
 {
+    let _t = PhaseTimer::start("relations_build_index");
     let pb = Progress::new(block_index.len() as u64, "Building relations index");
 
     // The per-member RocksDB lookups dominate this pass and are random reads
@@ -170,6 +172,7 @@ fn serialize_relations(
     string_refs: Vec<u64>,
     tags: &mut TagSerializer,
     missing: &mut MissingRefs,
+    lookup_time: &mut Duration,
 ) -> Result<Stats, Error> {
     let mut stats = Stats::default();
 
@@ -218,9 +221,11 @@ fn serialize_relations(
 
         match member_type.unwrap() {
             osmpbf::relation::MemberType::Node => {
+                let t0 = Instant::now();
                 let idx = db
                     .get_cf(cf_node_id_to_idx, memid.to_be_bytes())?
                     .map(|v| u64::from_be_bytes(v[0..8].try_into().unwrap()));
+                *lookup_time += t0.elapsed();
                 if idx.is_none() {
                     missing.nodes_in_relations.insert(memid);
                 }
@@ -230,9 +235,11 @@ fn serialize_relations(
                 member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
             }
             osmpbf::relation::MemberType::Way => {
+                let t0 = Instant::now();
                 let idx = db
                     .get_cf(cf_way_id_to_idx, memid.to_be_bytes())?
                     .map(|v| u64::from_be_bytes(v[0..8].try_into().unwrap()));
+                *lookup_time += t0.elapsed();
                 if idx.is_none() {
                     missing.ways_in_relations.insert(memid);
                 }
@@ -310,7 +317,10 @@ pub fn serialize_relation_blocks(
     // again to relations.
     let (found, unresolved) =
         build_relations_index(data, blocks.clone().into_iter(), db, node_locations)?;
-    let found = resolve_all_relations(found, unresolved);
+    let found = {
+        let _t = PhaseTimer::start("relations_resolve_nested");
+        resolve_all_relations(found, unresolved)
+    };
 
     let relations_cf = db.cf_handle(RELATIONS).unwrap();
     let relations_string_refs = db.cf_handle(RELATIONS_STRING_REFS).unwrap();
@@ -323,32 +333,35 @@ pub fn serialize_relation_blocks(
     // family yields spatial order. Relations with no resolvable member geometry
     // get the `RELATION_NO_BBOX` sentinel and a `u64::MAX` key so they sort last
     // and are never matched spatially (but are still emitted).
-    for v in blocks
-        .into_iter()
-        .map(|idx| read_block::<PrimitiveBlock>(data, &idx))
     {
-        let block = v?;
+        let _t = PhaseTimer::start("relations_convert");
+        for v in blocks
+            .into_iter()
+            .map(|idx| read_block::<PrimitiveBlock>(data, &idx))
+        {
+            let block = v?;
 
-        let string_refs = add_string_table(&block.stringtable, stringtable)?;
+            let string_refs = add_string_table(&block.stringtable, stringtable)?;
 
-        pb.inc(1);
+            pb.inc(1);
 
-        for rel in block.primitivegroup.into_iter().flat_map(|g| g.relations) {
-            let id = rel.id;
-            let mbb = found
-                .get(&id)
-                .and_then(|info| relation_mbb(&info.points, coord_scale));
-            let spatial_index = match mbb {
-                Some(mbb) => relation_spatial_index(&curve, mbb, coord_scale),
-                None => u64::MAX,
-            };
-            let key = OsmKey::new(spatial_index, id).serialize();
-            db.put_cf(relations_cf, &key, rel.encode_to_vec())?;
-            db.put_cf(
-                relations_string_refs,
-                &key,
-                create_relation_values(string_refs.as_slice()),
-            )?;
+            for rel in block.primitivegroup.into_iter().flat_map(|g| g.relations) {
+                let id = rel.id;
+                let mbb = found
+                    .get(&id)
+                    .and_then(|info| relation_mbb(&info.points, coord_scale));
+                let spatial_index = match mbb {
+                    Some(mbb) => relation_spatial_index(&curve, mbb, coord_scale),
+                    None => u64::MAX,
+                };
+                let key = OsmKey::new(spatial_index, id).serialize();
+                db.put_cf(relations_cf, &key, rel.encode_to_vec())?;
+                db.put_cf(
+                    relations_string_refs,
+                    &key,
+                    create_relation_values(string_refs.as_slice()),
+                )?;
+            }
         }
     }
     pb.finish();
@@ -361,12 +374,15 @@ pub fn serialize_relation_blocks(
     // its final index, so relation members can be resolved in the second pass
     // (a relation may reference another relation that sorts after it).
     let mut relation_id_to_idx: AHashMap<i64, u64> = AHashMap::new();
-    for (idx, res) in db
-        .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
-        .enumerate()
     {
-        let (key, _) = res?;
-        relation_id_to_idx.insert(OsmKey::from(key).id, idx as u64);
+        let _t = PhaseTimer::start("relations_id_to_idx_scan");
+        for (idx, res) in db
+            .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
+            .enumerate()
+        {
+            let (key, _) = res?;
+            relation_id_to_idx.insert(OsmKey::from(key).id, idx as u64);
+        }
     }
 
     let mut relations = builder.start_relations()?;
@@ -375,6 +391,12 @@ pub fn serialize_relation_blocks(
     let pb = Progress::new(relation_id_to_idx.len() as u64, "Ordering relations");
 
     // Second pass: write the relations in spatial order, resolving members.
+    // `lookup_time` isolates the per-member `get_cf` calls (a serial,
+    // one-round-trip-per-member point lookup, unlike the batched parallel
+    // `multi_get` the way-ordering pass uses) so the debug timing shows how
+    // much of this phase is lookup-bound vs decode/serialize/write-bound.
+    let mut lookup_time = Duration::ZERO;
+    let ordering_start = Instant::now();
     for res in db
         .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
         .zip(db.iterator_cf(relations_string_refs, rocksdb::IteratorMode::Start))
@@ -403,9 +425,18 @@ pub fn serialize_relation_blocks(
             string_refs,
             tags,
             missing,
+            &mut lookup_time,
         )?;
         pb.inc(1);
     }
+    let ordering_secs = ordering_start.elapsed().as_secs_f64();
+    let lookup_secs = lookup_time.as_secs_f64();
+    log::debug!("[timing] phase=\"relations_ordering_total\" secs={ordering_secs:.3}");
+    log::debug!("[timing] phase=\"relations_ordering_member_lookups\" secs={lookup_secs:.3}");
+    log::debug!(
+        "[timing] phase=\"relations_ordering_other\" secs={:.3}",
+        ordering_secs - lookup_secs
+    );
 
     {
         let sentinel = relations.grow()?;

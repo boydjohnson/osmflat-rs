@@ -204,3 +204,32 @@ impl Progress {
         }
     }
 }
+
+/// RAII wall-clock timer for the iterative perf-tuning workflow: logs the
+/// labeled phase's duration at `debug` level when dropped, so a phase that
+/// exits early via `?` still gets timed. Lines are grep/parseable as
+/// `[timing] phase="<label>" secs=<f64>`, one per phase per run, meant to be
+/// diffed across runs with different RocksDB/CLI tuning flags.
+pub struct PhaseTimer {
+    label: &'static str,
+    start: std::time::Instant,
+}
+
+impl PhaseTimer {
+    pub fn start(label: &'static str) -> Self {
+        Self {
+            label,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        log::debug!(
+            "[timing] phase=\"{}\" secs={:.3}",
+            self.label,
+            self.start.elapsed().as_secs_f64()
+        );
+    }
+}
