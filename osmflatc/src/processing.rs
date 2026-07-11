@@ -7,7 +7,7 @@ use rocksdb::{
     IteratorMode, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
-use way::storage::{WayIdToIdxTDC, WayIdToMbbTDC, WayTDC};
+use way::storage::{ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayRefByNodeTDC, WayTDC};
 
 use crate::error::OsmFlatcError;
 use relation::storage::{RELATIONS, RELATIONS_STRING_REFS};
@@ -249,7 +249,7 @@ pub fn create_db(
     block_cache_bytes: usize,
     write_buffer_bytes: usize,
     max_open_files: i32,
-) -> Result<(DB, TempDir), Box<dyn std::error::Error>> {
+) -> Result<(DB, TempDir, Options), Box<dyn std::error::Error>> {
     let scratch = tempfile::Builder::new()
         .prefix(".osmflatc-scratch-")
         .tempdir_in(scratch_parent)?;
@@ -313,6 +313,11 @@ pub fn create_db(
         WayTDC::NAME,
         WayIdToMbbTDC::NAME,
         WayIdToIdxTDC::NAME,
+        // Temporary indexes for the way-ordering pass's sort-merge join (see
+        // way.rs) -- same bulk-load lifecycle as everything else above: one
+        // pass writes each fully, the next only reads it.
+        WayRefByNodeTDC::NAME,
+        ResolvedRefTDC::NAME,
         RELATIONS,
         RELATIONS_STRING_REFS,
     ]
@@ -356,8 +361,14 @@ pub fn create_db(
     // bigger machines.
     db_opts.set_max_open_files(max_open_files);
 
+    // Cheap ticker/histogram counters (block-cache hit/miss, bytes read, ...),
+    // queried later via the returned `Options` to check whether a random-read
+    // pass is actually landing in the block cache -- see the way-ordering
+    // pass's per-chunk cache-hit logging in way.rs.
+    db_opts.enable_statistics();
+
     let db = DB::open_cf_descriptors(&db_opts, scratch.path(), cfs)?;
-    Ok((db, scratch))
+    Ok((db, scratch, db_opts))
 }
 
 #[cfg(test)]
@@ -371,7 +382,8 @@ mod create_db_tests {
     #[test]
     fn open_write_flush_read() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, _scratch) = create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
+        let (db, _scratch, _db_opts) =
+            create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
 
         let cf = db.cf_handle(NodeIdToLonLatTDC::NAME).unwrap();
         let key = 42i64.to_be_bytes();
