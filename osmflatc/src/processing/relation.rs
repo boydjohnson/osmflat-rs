@@ -5,13 +5,14 @@ use crate::{
     processing::{
         finalize_bulk_cfs,
         node::storage::NodeIdToIdxTDC,
-        storage::{OsmIdKey, OsmKey},
+        storage::{EmptyValue, OrdinalKey, OsmIdKey, OsmIdxValue, OsmKey, RefKey},
         way::storage::{WayIdToIdxTDC, WayIdToMbbTDC},
-        Key, NodeLocations, RocksDBSync, TempDataCodec,
+        write_batch_no_wal, Key, NodeLocations, RocksDB, RocksDBSync, RocksDBUnsync, TempDataCodec,
+        WriteBatchInternal,
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
-    Error, PhaseTimer, Progress, TagSerializer,
+    Error, PhaseTimer, Progress, TagSerializer, BATCH_SIZE,
 };
 use ahash::AHashMap;
 use geo::{BoundingRect, MultiPoint};
@@ -21,9 +22,10 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use rocksdb::DB;
 use space_time::xzorder::xz2_sfc::XZ2SFC;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use storage::{
-    break_relation_values, create_relation_values, RelationInfo, RELATIONS, RELATIONS_STRING_REFS,
+    break_relation_values, create_relation_values, RelationInfo, RelationMemberResolvedTDC,
+    RelationNodeMemberRefTDC, RelationWayMemberRefTDC, RELATIONS, RELATIONS_STRING_REFS,
 };
 
 pub(crate) mod storage;
@@ -160,24 +162,51 @@ fn resolve_all_relations(
     found
 }
 
+/// Advances `cur` (a merge-join cursor already positioned at or before
+/// `ordinal`) up to `ordinal`, then returns the resolved index if `cur` is
+/// now exactly on it. Shared by the node- and way-member cases in
+/// `serialize_relations` below -- same two-pointer pattern as way.rs's
+/// ordering pass.
+fn advance_and_resolve<I>(
+    iter: &mut I,
+    cur: &mut Option<(OrdinalKey, OsmIdxValue)>,
+    ordinal: u64,
+) -> Result<Option<u64>, OsmFlatcError>
+where
+    I: Iterator<Item = Result<(OrdinalKey, OsmIdxValue), OsmFlatcError>>,
+{
+    while let Some((key, _)) = cur {
+        if key.ordinal < ordinal {
+            *cur = iter.next().transpose()?;
+        } else {
+            break;
+        }
+    }
+    Ok(match cur {
+        Some((key, val)) if key.ordinal == ordinal => Some(val.idx),
+        _ => None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn serialize_relations(
+fn serialize_relations<I>(
     pbf_relation: &osmpbf::Relation,
     mbb: [i32; 4],
     relation_id_to_idx: &AHashMap<i64, u64>,
-    db: &DB,
+    resolved_iter: &mut I,
+    resolved_cur: &mut Option<(OrdinalKey, OsmIdxValue)>,
+    ordinal: &mut u64,
     relations: &mut flatdata::ExternalVector<osmflat::Relation>,
     relation_ids: &mut Option<flatdata::ExternalVector<osmflat::Id>>,
     relation_members: &mut flatdata::MultiVector<osmflat::RelationMembers>,
     string_refs: Vec<u64>,
     tags: &mut TagSerializer,
     missing: &mut MissingRefs,
-    lookup_time: &mut Duration,
-) -> Result<Stats, Error> {
+) -> Result<Stats, Error>
+where
+    I: Iterator<Item = Result<(OrdinalKey, OsmIdxValue), OsmFlatcError>>,
+{
     let mut stats = Stats::default();
-
-    let cf_node_id_to_idx = db.cf_handle(NodeIdToIdxTDC::NAME).unwrap();
-    let cf_way_id_to_idx = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
 
     debug_assert_eq!(
         pbf_relation.keys.len(),
@@ -221,11 +250,8 @@ fn serialize_relations(
 
         match member_type.unwrap() {
             osmpbf::relation::MemberType::Node => {
-                let t0 = Instant::now();
-                let idx = db
-                    .get_cf(cf_node_id_to_idx, memid.to_be_bytes())?
-                    .map(|v| u64::from_be_bytes(v[0..8].try_into().unwrap()));
-                *lookup_time += t0.elapsed();
+                let idx = advance_and_resolve(resolved_iter, resolved_cur, *ordinal)?;
+                *ordinal += 1;
                 if idx.is_none() {
                     missing.nodes_in_relations.insert(memid);
                 }
@@ -235,11 +261,8 @@ fn serialize_relations(
                 member.set_role_idx(string_refs[pbf_relation.roles_sid[i] as usize]);
             }
             osmpbf::relation::MemberType::Way => {
-                let t0 = Instant::now();
-                let idx = db
-                    .get_cf(cf_way_id_to_idx, memid.to_be_bytes())?
-                    .map(|v| u64::from_be_bytes(v[0..8].try_into().unwrap()));
-                *lookup_time += t0.elapsed();
+                let idx = advance_and_resolve(resolved_iter, resolved_cur, *ordinal)?;
+                *ordinal += 1;
                 if idx.is_none() {
                     missing.ways_in_relations.insert(memid);
                 }
@@ -251,8 +274,12 @@ fn serialize_relations(
             osmpbf::relation::MemberType::Relation => {
                 // Resolve the referenced relation to its index in the
                 // spatially-ordered relations vector. References to relations
-                // not in the archive become `None` (INVALID_IDX).
+                // not in the archive become `None` (INVALID_IDX). No entry in
+                // `RelationMemberResolvedTDC` for this member -- it's not a
+                // disk lookup, so `ordinal` still advances (to stay aligned
+                // with phase 0's assignment) but nothing is resolved from it.
                 let idx = relation_id_to_idx.get(&memid).copied();
+                *ordinal += 1;
                 if idx.is_none() {
                     missing.relations_in_relations.insert(memid);
                 }
@@ -390,13 +417,179 @@ pub fn serialize_relation_blocks(
 
     let pb = Progress::new(relation_id_to_idx.len() as u64, "Ordering relations");
 
-    // Second pass: write the relations in spatial order, resolving members.
-    // `lookup_time` isolates the per-member `get_cf` calls (a serial,
-    // one-round-trip-per-member point lookup, unlike the batched parallel
-    // `multi_get` the way-ordering pass uses) so the debug timing shows how
-    // much of this phase is lookup-bound vs decode/serialize/write-bound.
-    let mut lookup_time = Duration::ZERO;
+    // Resolving each node/way member used to be one `get_cf` point lookup per
+    // member -- serial, not even batched, so each paid full round-trip
+    // latency. Same fix as way.rs's ordering pass and for the same reason
+    // (confirmed there: cache misses against these CFs are genuine disk
+    // seeks, not CPU-bound work a scheduling tweak could help): a sort-merge
+    // join. Four sequential passes:
+    //   0. scan `RELATIONS` once, assign every member (any type) a global `ordinal`
+    //      -- its position in the flat per-relation member sequence -- and index
+    //      node/way members by their referenced id.
+    //   1. merge-join the node-id-sorted index against `NodeIdToIdx`.
+    //   1b. merge-join the way-id-sorted index against `WayIdToIdx` (same
+    //       output CF as 1 -- node- and way-member ordinals are disjoint).
+    //   2. scan `RELATIONS`/`RELATIONS_STRING_REFS` again (ordinals realign, same
+    //      immutable already-compacted source, same order) and merge in the
+    //      resolved indices to do the actual writes. Relation-type members skip all
+    //      of this -- `relation_id_to_idx` resolves them in-memory with no disk
+    //      I/O, same as before.
+
+    let t_build = Instant::now();
+    let total_members: u64;
+    {
+        let node_ref_cf = db.cf_handle(RelationNodeMemberRefTDC::NAME).unwrap();
+        let way_ref_cf = db.cf_handle(RelationWayMemberRefTDC::NAME).unwrap();
+        let mut node_ref_batch = WriteBatchInternal::default();
+        node_ref_batch.insert_cf(RelationNodeMemberRefTDC::NAME, node_ref_cf);
+        let mut way_ref_batch = WriteBatchInternal::default();
+        way_ref_batch.insert_cf(RelationWayMemberRefTDC::NAME, way_ref_cf);
+
+        let mut ordinal: u64 = 0;
+        for res in db.iterator_cf(relations_cf, rocksdb::IteratorMode::Start) {
+            let (_key, rel) = res?;
+            let relation = osmpbf::Relation::decode(rel.to_vec().as_slice())?;
+            let mut memid = 0;
+            for i in 0..relation.memids.len() {
+                memid += relation.memids[i];
+                let member_type = osmpbf::relation::MemberType::try_from(relation.types[i]);
+                debug_assert!(member_type.is_ok());
+                match member_type.unwrap() {
+                    osmpbf::relation::MemberType::Node => {
+                        node_ref_batch.put::<RelationNodeMemberRefTDC>(
+                            RefKey::new(memid, ordinal),
+                            EmptyValue,
+                        );
+                    }
+                    osmpbf::relation::MemberType::Way => {
+                        way_ref_batch.put::<RelationWayMemberRefTDC>(
+                            RefKey::new(memid, ordinal),
+                            EmptyValue,
+                        );
+                    }
+                    osmpbf::relation::MemberType::Relation => {}
+                }
+                ordinal += 1;
+                if ordinal.is_multiple_of(BATCH_SIZE as u64) {
+                    write_batch_no_wal(db, node_ref_batch.inner())?;
+                    node_ref_batch = WriteBatchInternal::default();
+                    let node_ref_cf = db.cf_handle(RelationNodeMemberRefTDC::NAME).unwrap();
+                    node_ref_batch.insert_cf(RelationNodeMemberRefTDC::NAME, node_ref_cf);
+
+                    write_batch_no_wal(db, way_ref_batch.inner())?;
+                    way_ref_batch = WriteBatchInternal::default();
+                    let way_ref_cf = db.cf_handle(RelationWayMemberRefTDC::NAME).unwrap();
+                    way_ref_batch.insert_cf(RelationWayMemberRefTDC::NAME, way_ref_cf);
+                }
+            }
+        }
+        write_batch_no_wal(db, node_ref_batch.inner())?;
+        write_batch_no_wal(db, way_ref_batch.inner())?;
+        total_members = ordinal;
+    }
+    log::debug!(
+        "[timing] phase=\"relations_ordering_build_refs\" secs={:.3} total_members={total_members}",
+        t_build.elapsed().as_secs_f64()
+    );
+    info!("Compacting relation member-ref indexes...");
+    finalize_bulk_cfs(
+        db,
+        &[
+            RelationNodeMemberRefTDC::NAME,
+            RelationWayMemberRefTDC::NAME,
+        ],
+    )?;
+
+    let t_join_nodes = Instant::now();
+    {
+        let mut node_iter = <DB as RocksDB>::iterator::<NodeIdToIdxTDC>(db)?;
+        let mut node_cur: Option<(OsmIdKey, OsmIdxValue)> = node_iter.next().transpose()?;
+        let resolved_cf = db.cf_handle(RelationMemberResolvedTDC::NAME).unwrap();
+        let mut resolved_batch = WriteBatchInternal::default();
+        resolved_batch.insert_cf(RelationMemberResolvedTDC::NAME, resolved_cf);
+        let mut refs_seen: u64 = 0;
+        let mut resolved_count: u64 = 0;
+        for r in <DB as RocksDB>::iterator::<RelationNodeMemberRefTDC>(db)? {
+            let (ref_key, _) = r?;
+            while let Some((node_key, _)) = &node_cur {
+                if node_key.id < ref_key.target_id {
+                    node_cur = node_iter.next().transpose()?;
+                } else {
+                    break;
+                }
+            }
+            if let Some((node_key, node_val)) = &node_cur {
+                if node_key.id == ref_key.target_id {
+                    resolved_batch.put::<RelationMemberResolvedTDC>(
+                        OrdinalKey::new(ref_key.ordinal),
+                        OsmIdxValue::new(node_val.idx),
+                    );
+                    resolved_count += 1;
+                }
+            }
+            refs_seen += 1;
+            if refs_seen.is_multiple_of(BATCH_SIZE as u64) {
+                write_batch_no_wal(db, resolved_batch.inner())?;
+                resolved_batch = WriteBatchInternal::default();
+                let resolved_cf = db.cf_handle(RelationMemberResolvedTDC::NAME).unwrap();
+                resolved_batch.insert_cf(RelationMemberResolvedTDC::NAME, resolved_cf);
+            }
+        }
+        write_batch_no_wal(db, resolved_batch.inner())?;
+        log::debug!(
+            "[timing] phase=\"relations_ordering_merge_join_nodes\" secs={:.3} refs={refs_seen} resolved={resolved_count}",
+            t_join_nodes.elapsed().as_secs_f64()
+        );
+    }
+
+    let t_join_ways = Instant::now();
+    {
+        let mut way_iter = <DB as RocksDB>::iterator::<WayIdToIdxTDC>(db)?;
+        let mut way_cur: Option<(OsmIdKey, OsmIdxValue)> = way_iter.next().transpose()?;
+        let resolved_cf = db.cf_handle(RelationMemberResolvedTDC::NAME).unwrap();
+        let mut resolved_batch = WriteBatchInternal::default();
+        resolved_batch.insert_cf(RelationMemberResolvedTDC::NAME, resolved_cf);
+        let mut refs_seen: u64 = 0;
+        let mut resolved_count: u64 = 0;
+        for r in <DB as RocksDB>::iterator::<RelationWayMemberRefTDC>(db)? {
+            let (ref_key, _) = r?;
+            while let Some((way_key, _)) = &way_cur {
+                if way_key.id < ref_key.target_id {
+                    way_cur = way_iter.next().transpose()?;
+                } else {
+                    break;
+                }
+            }
+            if let Some((way_key, way_val)) = &way_cur {
+                if way_key.id == ref_key.target_id {
+                    resolved_batch.put::<RelationMemberResolvedTDC>(
+                        OrdinalKey::new(ref_key.ordinal),
+                        OsmIdxValue::new(way_val.idx),
+                    );
+                    resolved_count += 1;
+                }
+            }
+            refs_seen += 1;
+            if refs_seen.is_multiple_of(BATCH_SIZE as u64) {
+                write_batch_no_wal(db, resolved_batch.inner())?;
+                resolved_batch = WriteBatchInternal::default();
+                let resolved_cf = db.cf_handle(RelationMemberResolvedTDC::NAME).unwrap();
+                resolved_batch.insert_cf(RelationMemberResolvedTDC::NAME, resolved_cf);
+            }
+        }
+        write_batch_no_wal(db, resolved_batch.inner())?;
+        log::debug!(
+            "[timing] phase=\"relations_ordering_merge_join_ways\" secs={:.3} refs={refs_seen} resolved={resolved_count}",
+            t_join_ways.elapsed().as_secs_f64()
+        );
+    }
+    info!("Compacting relation member resolution index...");
+    finalize_bulk_cfs(db, &[RelationMemberResolvedTDC::NAME])?;
+
     let ordering_start = Instant::now();
+    let mut resolved_iter = <DB as RocksDB>::iterator::<RelationMemberResolvedTDC>(db)?;
+    let mut resolved_cur: Option<(OrdinalKey, OsmIdxValue)> = resolved_iter.next().transpose()?;
+    let mut ordinal: u64 = 0;
     for res in db
         .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
         .zip(db.iterator_cf(relations_string_refs, rocksdb::IteratorMode::Start))
@@ -418,24 +611,21 @@ pub fn serialize_relation_blocks(
             &relation,
             mbb,
             &relation_id_to_idx,
-            db,
+            &mut resolved_iter,
+            &mut resolved_cur,
+            &mut ordinal,
             &mut relations,
             &mut relation_ids,
             &mut relation_members,
             string_refs,
             tags,
             missing,
-            &mut lookup_time,
         )?;
         pb.inc(1);
     }
-    let ordering_secs = ordering_start.elapsed().as_secs_f64();
-    let lookup_secs = lookup_time.as_secs_f64();
-    log::debug!("[timing] phase=\"relations_ordering_total\" secs={ordering_secs:.3}");
-    log::debug!("[timing] phase=\"relations_ordering_member_lookups\" secs={lookup_secs:.3}");
     log::debug!(
-        "[timing] phase=\"relations_ordering_other\" secs={:.3}",
-        ordering_secs - lookup_secs
+        "[timing] phase=\"relations_ordering_final_write\" secs={:.3}",
+        ordering_start.elapsed().as_secs_f64()
     );
 
     {

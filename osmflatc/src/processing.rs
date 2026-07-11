@@ -10,7 +10,10 @@ use tempfile::TempDir;
 use way::storage::{ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayRefByNodeTDC, WayTDC};
 
 use crate::error::OsmFlatcError;
-use relation::storage::{RELATIONS, RELATIONS_STRING_REFS};
+use relation::storage::{
+    RelationMemberResolvedTDC, RelationNodeMemberRefTDC, RelationWayMemberRefTDC, RELATIONS,
+    RELATIONS_STRING_REFS,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
@@ -320,6 +323,11 @@ pub fn create_db(
         ResolvedRefTDC::NAME,
         RELATIONS,
         RELATIONS_STRING_REFS,
+        // Temporary indexes for the relation-member ordering pass's
+        // sort-merge join (see relation.rs) -- same bulk-load lifecycle.
+        RelationNodeMemberRefTDC::NAME,
+        RelationWayMemberRefTDC::NAME,
+        RelationMemberResolvedTDC::NAME,
     ]
     .iter()
     .map(move |v| ColumnFamilyDescriptor::new(v.to_string(), cf_opts.clone()));

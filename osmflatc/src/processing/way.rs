@@ -5,7 +5,7 @@ use crate::{
     osmpbf::{self, read_block, BlockIndex},
     processing::{
         node::storage::NodeIdToIdxTDC,
-        storage::{OsmIdKey, OsmIdxValue, OsmKey},
+        storage::{EmptyValue, OrdinalKey, OsmIdKey, OsmIdxValue, OsmKey, RefKey},
         NodeLocations, RocksDB, RocksDBUnsync, TempDataCodec,
     },
     stats::{MissingRefs, Stats},
@@ -18,8 +18,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use rocksdb::{statistics::Ticker, Options, DB};
 use storage::{
-    EmptyValue, NodeRefKey, OrdinalKey, ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayMbbValue,
-    WayRefByNodeTDC, WayTDC, WayValue,
+    ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayMbbValue, WayRefByNodeTDC, WayTDC, WayValue,
 };
 
 pub(crate) mod storage;
@@ -215,7 +214,7 @@ pub fn serialize_way_blocks(
         for r in <DB as RocksDB>::iterator::<WayTDC>(db)? {
             let (_way_id, v) = r?;
             for &n in &v.node_refs {
-                ref_batch.put::<WayRefByNodeTDC>(NodeRefKey::new(n, ordinal), EmptyValue);
+                ref_batch.put::<WayRefByNodeTDC>(RefKey::new(n, ordinal), EmptyValue);
                 ordinal += 1;
                 if ordinal.is_multiple_of(BATCH_SIZE as u64) {
                     write_batch_no_wal(db, ref_batch.inner())?;
@@ -252,21 +251,21 @@ pub fn serialize_way_blocks(
         for r in <DB as RocksDB>::iterator::<WayRefByNodeTDC>(db)? {
             let (ref_key, _) = r?;
             while let Some((node_key, _)) = &node_cur {
-                if node_key.id < ref_key.node_id {
+                if node_key.id < ref_key.target_id {
                     node_cur = node_iter.next().transpose()?;
                 } else {
                     break;
                 }
             }
             if let Some((node_key, node_val)) = &node_cur {
-                if node_key.id == ref_key.node_id {
+                if node_key.id == ref_key.target_id {
                     resolved_batch.put::<ResolvedRefTDC>(
                         OrdinalKey::new(ref_key.ordinal),
                         OsmIdxValue::new(node_val.idx),
                     );
                     resolved_count += 1;
                 }
-                // else `node_key.id > ref_key.node_id`: this ref's node is
+                // else `node_key.id > ref_key.target_id`: this ref's node is
                 // absent from the archive -- leave it unresolved, same as the
                 // old `multi_get` code's `None` for a missing key.
             }

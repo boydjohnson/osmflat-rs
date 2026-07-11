@@ -1,5 +1,10 @@
 use std::collections::BTreeSet;
 
+use crate::processing::{
+    storage::{EmptyValue, OrdinalKey, OsmIdxValue, RefKey},
+    TempDataCodec,
+};
+
 /// RocksDB column family holding the encoded relations, keyed by spatial order.
 pub const RELATIONS: &str = "relations";
 /// RocksDB column family holding the relations' string references, in the same
@@ -32,4 +37,43 @@ impl RelationInfo {
     pub fn is_ready(&self) -> bool {
         self.relation_ids.is_empty()
     }
+}
+
+/// Forward index for the sort-merge join in the relation-member ordering
+/// pass, keyed by referenced node id -- merge-joined against `NodeIdToIdx`
+/// the same way `WayRefByNodeTDC` is joined for way-refs. See relation.rs.
+pub struct RelationNodeMemberRefTDC;
+
+impl TempDataCodec for RelationNodeMemberRefTDC {
+    type Key = RefKey;
+    type Value = EmptyValue;
+
+    const NAME: &'static str = "RELATION_NODE_MEMBER_REF";
+}
+
+/// Forward index keyed by referenced way id, merge-joined against
+/// `WayIdToIdx`. See relation.rs.
+pub struct RelationWayMemberRefTDC;
+
+impl TempDataCodec for RelationWayMemberRefTDC {
+    type Key = RefKey;
+    type Value = EmptyValue;
+
+    const NAME: &'static str = "RELATION_WAY_MEMBER_REF";
+}
+
+/// Resolved `ordinal -> idx` output of both merge-joins above, keyed by each
+/// member's position in the flat `relation_members` structure being built.
+/// Node- and way-member ordinals are disjoint subsets of the same ordinal
+/// space (assigned once per relation-member regardless of type), so both
+/// merge-joins can safely write into this one CF. Relation-type members
+/// never get an entry here -- they're resolved directly from the in-memory
+/// `relation_id_to_idx` map instead, since that needs no disk I/O at all.
+pub struct RelationMemberResolvedTDC;
+
+impl TempDataCodec for RelationMemberResolvedTDC {
+    type Key = OrdinalKey;
+    type Value = OsmIdxValue;
+
+    const NAME: &'static str = "RELATION_MEMBER_RESOLVED_BY_ORDINAL";
 }
