@@ -286,7 +286,7 @@ pub fn serialize_way_blocks(
     let cache_hit_after = db_opts.get_ticker_count(Ticker::BlockCacheDataHit);
     let cache_miss_after = db_opts.get_ticker_count(Ticker::BlockCacheDataMiss);
     log::debug!(
-        "[timing] phase=\"ways_ordering_merge_join_cache\" block_cache_data_hit={} block_cache_data_miss={}",
+        "[timing] phase=\"ways_ordering_merge_join_cache\" secs=0.000 block_cache_data_hit={} block_cache_data_miss={}",
         cache_hit_after - cache_hit_before,
         cache_miss_after - cache_miss_before
     );
