@@ -7,3 +7,9 @@ resolver = "2"
 
 [patch.crates-io]
 osmflat = { path = "osmflat" }
+
+[profile.release]
+debug = true
+codegen-units = 1
+lto = "thin"
+
