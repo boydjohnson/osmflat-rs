@@ -17,15 +17,14 @@ use crate::{
 use ahash::AHashMap;
 use geo::{BoundingRect, MultiPoint};
 use log::info;
-use prost::Message;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use rocksdb::DB;
 use space_time::xzorder::xz2_sfc::XZ2SFC;
 use std::collections::VecDeque;
 use std::time::Instant;
 use storage::{
-    break_relation_values, create_relation_values, RelationInfo, RelationMemberResolvedTDC,
-    RelationNodeMemberRefTDC, RelationWayMemberRefTDC, RELATIONS, RELATIONS_STRING_REFS,
+    decode_relation, encode_relation, RelationInfo, RelationMemberResolvedTDC,
+    RelationNodeMemberRefTDC, RelationWayMemberRefTDC, RELATIONS,
 };
 
 pub(crate) mod storage;
@@ -350,7 +349,6 @@ pub fn serialize_relation_blocks(
     };
 
     let relations_cf = db.cf_handle(RELATIONS).unwrap();
-    let relations_string_refs = db.cf_handle(RELATIONS_STRING_REFS).unwrap();
 
     let curve = osmflat::way_curve();
 
@@ -372,7 +370,7 @@ pub fn serialize_relation_blocks(
 
             pb.inc(1);
 
-            for rel in block.primitivegroup.into_iter().flat_map(|g| g.relations) {
+            for mut rel in block.primitivegroup.into_iter().flat_map(|g| g.relations) {
                 let id = rel.id;
                 let mbb = found
                     .get(&id)
@@ -382,20 +380,15 @@ pub fn serialize_relation_blocks(
                     None => u64::MAX,
                 };
                 let key = OsmKey::new(spatial_index, id).serialize();
-                db.put_cf(relations_cf, &key, rel.encode_to_vec())?;
-                db.put_cf(
-                    relations_string_refs,
-                    &key,
-                    create_relation_values(string_refs.as_slice()),
-                )?;
+                db.put_cf(relations_cf, &key, encode_relation(&mut rel, &string_refs))?;
             }
         }
     }
     pb.finish();
 
-    // Write->read boundary: both ordered scans below read these families.
-    info!("Compacting relation column families...");
-    finalize_bulk_cfs(db, &[RELATIONS, RELATIONS_STRING_REFS])?;
+    // Write->read boundary: the ordered scans below read this family.
+    info!("Compacting relation column family...");
+    finalize_bulk_cfs(db, &[RELATIONS])?;
 
     // First pass over the spatially-ordered relations: map each relation id to
     // its final index, so relation members can be resolved in the second pass
@@ -429,8 +422,8 @@ pub fn serialize_relation_blocks(
     //   1. merge-join the node-id-sorted index against `NodeIdToIdx`.
     //   1b. merge-join the way-id-sorted index against `WayIdToIdx` (same
     //       output CF as 1 -- node- and way-member ordinals are disjoint).
-    //   2. scan `RELATIONS`/`RELATIONS_STRING_REFS` again (ordinals realign, same
-    //      immutable already-compacted source, same order) and merge in the
+    //   2. scan `RELATIONS` again (ordinals realign, same immutable
+    //      already-compacted source, same order) and merge in the
     //      resolved indices to do the actual writes. Relation-type members skip all
     //      of this -- `relation_id_to_idx` resolves them in-memory with no disk
     //      I/O, same as before.
@@ -448,7 +441,7 @@ pub fn serialize_relation_blocks(
         let mut ordinal: u64 = 0;
         for res in db.iterator_cf(relations_cf, rocksdb::IteratorMode::Start) {
             let (_key, rel) = res?;
-            let relation = osmpbf::Relation::decode(rel.to_vec().as_slice())?;
+            let (relation, _) = decode_relation(&rel)?;
             let mut memid = 0;
             for i in 0..relation.memids.len() {
                 memid += relation.memids[i];
@@ -590,16 +583,11 @@ pub fn serialize_relation_blocks(
     let mut resolved_iter = <DB as RocksDB>::iterator::<RelationMemberResolvedTDC>(db)?;
     let mut resolved_cur: Option<(OrdinalKey, OsmIdxValue)> = resolved_iter.next().transpose()?;
     let mut ordinal: u64 = 0;
-    for res in db
-        .iterator_cf(relations_cf, rocksdb::IteratorMode::Start)
-        .zip(db.iterator_cf(relations_string_refs, rocksdb::IteratorMode::Start))
-    {
-        let (key, rel) = res.0?;
-        let (_, string_refs) = res.1?;
+    for res in db.iterator_cf(relations_cf, rocksdb::IteratorMode::Start) {
+        let (key, rel) = res?;
 
         let id = OsmKey::from(key).id;
-        let relation = osmpbf::Relation::decode(rel.to_vec().as_slice())?;
-        let string_refs = break_relation_values(&string_refs);
+        let (relation, string_refs) = decode_relation(&rel)?;
 
         // Relations without resolvable member geometry carry the sentinel bbox.
         let mbb = found

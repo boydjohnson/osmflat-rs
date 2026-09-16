@@ -12,7 +12,6 @@ use way::storage::{ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayRefByNodeTDC
 use crate::error::OsmFlatcError;
 use relation::storage::{
     RelationMemberResolvedTDC, RelationNodeMemberRefTDC, RelationWayMemberRefTDC, RELATIONS,
-    RELATIONS_STRING_REFS,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -322,7 +321,6 @@ pub fn create_db(
         WayRefByNodeTDC::NAME,
         ResolvedRefTDC::NAME,
         RELATIONS,
-        RELATIONS_STRING_REFS,
         // Temporary indexes for the relation-member ordering pass's
         // sort-merge join (see relation.rs) -- same bulk-load lifecycle.
         RelationNodeMemberRefTDC::NAME,
