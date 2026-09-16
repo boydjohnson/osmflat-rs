@@ -77,8 +77,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # --locked: a published binary should be built from the dependency graph
+      # in the tag, not whatever resolved that morning.
       - name: Build
-        run: cargo build --profile dist -p osmflatc --target ${{ matrix.target }}
+        run: cargo build --locked --profile dist -p osmflatc --target ${{ matrix.target }}
 
       # Catches a binary that built but can't run -- a missing runtime DLL, or
       # a cross-compiled arch the runner can't execute.

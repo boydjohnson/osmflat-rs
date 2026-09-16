@@ -67,15 +67,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - run: cargo build --all-targets
+      # --locked everywhere, so CI exercises the same dependency graph a
+      # release build will, and a stale Cargo.lock fails here rather than
+      # silently resolving to something newer.
+      - run: cargo build --locked --all-targets
 
-      - run: cargo test
+      - run: cargo test --locked
 
       # `-D warnings` goes after `--` so it governs this workspace only. As
       # RUSTFLAGS it would also apply to every dependency, and a warning in
       # rocksdb or prost-generated code would fail CI over something this repo
       # cannot fix.
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   rustfmt:
     name: rustfmt
@@ -106,4 +109,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: docs
-      - run: cargo doc --no-deps
+      - run: cargo doc --locked --no-deps
