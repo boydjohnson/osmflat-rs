@@ -1,29 +1,79 @@
 use std::collections::BTreeSet;
 
-use crate::processing::{
-    storage::{EmptyValue, OrdinalKey, OsmIdxValue, RefKey},
-    TempDataCodec,
+use crate::{
+    osmpbf,
+    processing::{
+        storage::{EmptyValue, OrdinalKey, OsmIdxValue, RefKey},
+        TempDataCodec,
+    },
 };
+use ahash::AHashMap;
+use prost::Message;
 
 /// RocksDB column family holding the encoded relations, keyed by spatial order.
+/// Each value is produced by [`encode_relation`].
 pub const RELATIONS: &str = "relations";
-/// RocksDB column family holding the relations' string references, in the same
-/// order as [`RELATIONS`].
-pub const RELATIONS_STRING_REFS: &str = "relations_string_refs";
 
-pub fn create_relation_values(string_refs: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 * string_refs.len());
-    for s in string_refs {
+/// Encode a relation for the [`RELATIONS`] column family, together with the
+/// global string-table ids it references.
+///
+/// `block_string_refs` maps the PBF block's string-table indices to global
+/// string ids. Storing that whole mapping per relation (as this used to do) is
+/// catastrophically wasteful: a relation block's string table averages ~12K
+/// entries, so on a Germany extract 910K relations wrote 81 GiB into RocksDB
+/// -- one 175s compaction for what is really a few hundred MB of data.
+/// Instead `rel`'s `keys`, `vals` and `roles_sid` are rewritten in place to
+/// index a per-relation list holding only the (deduplicated) global ids this
+/// relation actually uses, and that list is stored inline ahead of the
+/// protobuf bytes:
+///
+/// ```text
+/// [n: u64 BE][n x global string id: u64 BE][prost-encoded Relation]
+/// ```
+///
+/// Global ids are byte offsets into the string table, so they can exceed the
+/// protobuf fields' 32-bit width on a planet file; the local indices never do.
+pub fn encode_relation(rel: &mut osmpbf::Relation, block_string_refs: &[u64]) -> Vec<u8> {
+    let mut local: Vec<u64> = Vec::new();
+    let mut lookup: AHashMap<u64, u32> = AHashMap::new();
+    let mut remap = |block_idx: usize| -> u32 {
+        let global = block_string_refs[block_idx];
+        *lookup.entry(global).or_insert_with(|| {
+            local.push(global);
+            (local.len() - 1) as u32
+        })
+    };
+    for k in &mut rel.keys {
+        *k = remap(*k as usize);
+    }
+    for v in &mut rel.vals {
+        *v = remap(*v as usize);
+    }
+    for r in &mut rel.roles_sid {
+        *r = remap(*r as usize) as i32;
+    }
+
+    let mut out = Vec::with_capacity(8 + 8 * local.len() + rel.encoded_len());
+    out.extend((local.len() as u64).to_be_bytes());
+    for s in &local {
         out.extend(s.to_be_bytes());
     }
+    rel.encode(&mut out)
+        .expect("Vec<u8> has unbounded capacity");
     out
 }
 
-pub fn break_relation_values(bytes: &[u8]) -> Vec<u64> {
-    bytes
+/// Inverse of [`encode_relation`]: the relation (with block-local
+/// `keys`/`vals`/`roles_sid` indexing the returned list) and its global
+/// string ids.
+pub fn decode_relation(bytes: &[u8]) -> Result<(osmpbf::Relation, Vec<u64>), prost::DecodeError> {
+    let n = u64::from_be_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let string_refs = bytes[8..8 + 8 * n]
         .chunks(8)
-        .map(|chunk| u64::from_be_bytes(chunk[0..8].try_into().unwrap()))
-        .collect()
+        .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+        .collect();
+    let rel = osmpbf::Relation::decode(&bytes[8 + 8 * n..])?;
+    Ok((rel, string_refs))
 }
 
 #[derive(Debug, Default)]
