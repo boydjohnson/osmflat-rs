@@ -1,8 +1,11 @@
 name: ci
 
 # This fork's default branch is `main`; the trigger said `master`, so the
-# workflow had never run once. The build matrix also targeted `windows-2019`,
-# a runner GitHub has since retired.
+# workflow had never run once.
+#
+# Unix only: osmflatc isn't supported on Windows. Its madvise-based read hint
+# is unix-only (see `#[cfg(unix)]` in osmflatc/src/run.rs), so there is nothing
+# on Windows to keep working.
 on:
   push:
     branches: [main]
@@ -27,14 +30,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The same three platforms `release.yml` ships, so a target can't
-          # break in a release build without breaking here first.
+          # One runner per OS that `release.yml` ships. The release also builds
+          # x86_64 macOS, which nothing here covers -- the two mac targets differ
+          # only by arch on the same OS and toolchain, so the risk of an
+          # x86_64-only break is low, but it is a real gap rather than a
+          # guarantee. Add a macos-13 leg here if it ever bites.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: aarch64-apple-darwin
             os: macos-14
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -57,11 +61,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
-
-      - name: Point bindgen at LLVM (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
         with:

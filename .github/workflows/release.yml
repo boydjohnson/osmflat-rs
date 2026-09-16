@@ -3,6 +3,9 @@ name: release
 # Tagging `v*` publishes a release. `workflow_dispatch` builds the same
 # matrix without publishing, which is the only way to find out that a target
 # broke before a tag is already cut and public.
+#
+# Unix only: osmflatc isn't supported on Windows, so no Windows artifact is
+# published (see `#[cfg(unix)]` in osmflatc/src/run.rs).
 on:
   push:
     tags: ["v*"]
@@ -39,8 +42,6 @@ jobs:
             os: macos-14
           - target: x86_64-apple-darwin
             os: macos-13
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -65,12 +66,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
 
-      # Windows runners ship LLVM but don't point bindgen at it.
-      - name: Point bindgen at LLVM (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
-
       # That RocksDB build is the bulk of the wall clock, and it is identical
       # between a dry run and the tag that follows it.
       - uses: Swatinem/rust-cache@v2
@@ -82,13 +77,12 @@ jobs:
       - name: Build
         run: cargo build --locked --profile dist -p osmflatc --target ${{ matrix.target }}
 
-      # Catches a binary that built but can't run -- a missing runtime DLL, or
-      # a cross-compiled arch the runner can't execute.
+      # Catches a binary that built but can't run -- e.g. a cross-compiled arch
+      # the runner can't execute.
       - name: Smoke test
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/dist/osmflatc"
-          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
           "$bin" --version
           "$bin" --help > /dev/null
 
@@ -101,20 +95,11 @@ jobs:
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="osmflatc"))')"
           name="osmflatc-${version}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/dist/osmflatc.exe" "dist/$name/"
-          else
-            cp "target/${{ matrix.target }}/dist/osmflatc" "dist/$name/"
-          fi
+          cp "target/${{ matrix.target }}/dist/osmflatc" "dist/$name/"
           cp LICENSE-APACHE LICENSE-MIT README.md "dist/$name/"
           cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a -tzip "$name.zip" "$name" > /dev/null
-            echo "asset=$name.zip" >> "$GITHUB_OUTPUT"
-          else
-            tar czf "$name.tar.gz" "$name"
-            echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
+          tar czf "$name.tar.gz" "$name"
+          echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
