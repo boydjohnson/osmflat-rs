@@ -30,11 +30,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # One runner per OS that `release.yml` ships. The release also builds
-          # x86_64 macOS, which nothing here covers -- the two mac targets differ
-          # only by arch on the same OS and toolchain, so the risk of an
-          # x86_64-only break is low, but it is a real gap rather than a
-          # guarantee. Add a macos-13 leg here if it ever bites.
+          # Exactly what `release.yml` ships, so no target can break in a
+          # release build without breaking here first.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: aarch64-apple-darwin
