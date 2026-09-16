@@ -1,82 +1,109 @@
 name: ci
+
+# This fork's default branch is `main`; the trigger said `master`, so the
+# workflow had never run once. The build matrix also targeted `windows-2019`,
+# a runner GitHub has since retired.
 on:
-  pull_request:
   push:
-    branches:
-    - master
-  schedule:
-    - cron: '00 01 * * *'
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
+  CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: short
-  RUSTFLAGS: "-D warnings -W rust-2021-compatibility"
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  rust:
-    name: Rust
+  test:
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        build: [stable, macos, win-msvc, win-gnu]
         include:
-        - build: stable
-          os: ubuntu-latest
-          rust: stable
-        - build: macos
-          os: macOS-latest
-          rust: stable
-        - build: win-msvc
-          os: windows-2019
-          rust: stable
-        - build: win-gnu
-          os: windows-2019
-          rust: stable-x86_64-gnu
-    env:
-      RUSTFLAGS: -D warnings
-      CARGO_INCREMENTAL: 0
+          # The same three platforms `release.yml` ships, so a target can't
+          # break in a release build without breaking here first.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v1
-        with:
-          fetch-depth: 1
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
+      - uses: actions/checkout@v4
+
+      # osmflatc's build.rs runs prost-build over the OSM PBF .proto files.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Rust
-        uses: hecrj/setup-rust-action@v1
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          rust-version: ${{ matrix.rust }}
+          components: clippy
+
+      # librocksdb-sys builds RocksDB from source and runs bindgen over its
+      # headers, so it needs a C++ toolchain and libclang. macOS gets both from
+      # the Xcode command line tools.
+      - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
+
+      - name: Point bindgen at LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - run: cargo build --all-targets
+
       - run: cargo test
-      - run: cargo doc
+
+      # `-D warnings` goes after `--` so it governs this workspace only. As
+      # RUSTFLAGS it would also apply to every dependency, and a warning in
+      # rocksdb or prost-generated code would fail CI over something this repo
+      # cannot fix.
+      - run: cargo clippy --all-targets -- -D warnings
 
   rustfmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v1
-      with:
-        fetch-depth: 1
-    - name: Install rustfmt
-      run: rustup component add rustfmt
-    - name: Check formatting
-      run: cargo fmt -- --check
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Needs no protoc, no rocksdb build: style fails in seconds rather than
+      # behind a full C++ compile.
+      - run: cargo fmt --all --check
 
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
+  docs:
+    name: docs
+    runs-on: ubuntu-22.04
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v1
-      with:
-        fetch-depth: 1
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
-    - name: Install clippy
-      run: rustup component add clippy
-    - name: Clippy
-      run: cargo clippy --all-targets
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev llvm-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      - run: cargo doc --no-deps

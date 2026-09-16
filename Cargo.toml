@@ -13,3 +13,12 @@ debug = true
 codegen-units = 1
 lto = "thin"
 
+# What `release.yml` ships. `release` deliberately keeps `debug = true` so
+# profiling a local build stays useful, but that costs ~35% of the binary size
+# (10.3MB -> 6.7MB for osmflatc) and is dead weight in a download, so strip it
+# here rather than perturb the profile people build against day to day.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "symbols"
+
