@@ -159,11 +159,10 @@ pub fn read_block<T: prost::Message + Default>(
     let blob = Blob::decode(&data[idx.blob_start..idx.blob_start + idx.blob_len])?;
 
     let mut blob_buf = Vec::with_capacity(blob.raw_size.unwrap_or(0) as usize);
-    let blob_data = if blob.raw.is_some() {
-        blob.raw.as_ref().unwrap()
-    } else if blob.zlib_data.is_some() {
+    let blob_data = if let Some(raw) = &blob.raw {
+        raw
+    } else if let Some(data) = &blob.zlib_data {
         // decompress zlib data
-        let data: &Vec<u8> = blob.zlib_data.as_ref().unwrap();
         let mut decoder = ZlibDecoder::new(&data[..]);
         decoder.read_to_end(&mut blob_buf)?;
         &blob_buf
@@ -186,12 +185,11 @@ fn blob_type_and_granularity_from_blob_info(
     // `raw_size` is the exact decompressed length; reserving it up front
     // avoids several realloc+copy rounds per blob in `read_to_end`.
     let mut blob_buf = Vec::with_capacity(blob.raw_size.unwrap_or(0) as usize);
-    let blob_data = if blob.raw.is_some() {
+    let blob_data = if let Some(raw) = &blob.raw {
         // use raw bytes
-        blob.raw.as_ref().unwrap()
-    } else if blob.zlib_data.is_some() {
+        raw
+    } else if let Some(data) = &blob.zlib_data {
         // decompress zlib data
-        let data: &Vec<u8> = blob.zlib_data.as_ref().unwrap();
         let mut decoder = ZlibDecoder::new(&data[..]);
         decoder.read_to_end(&mut blob_buf).map_err(|e| {
             // A valid zlib stream starts 0x78; anything else at this offset

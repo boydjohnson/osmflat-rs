@@ -81,8 +81,13 @@ pub fn run(args: Args) -> Result<(), Error> {
     // order), so hint the kernel for sequential access: more aggressive
     // readahead plus drop-behind of already-read pages, which improves
     // throughput and keeps the page cache from competing with the RocksDB block
-    // cache and memtables. Best-effort -- a failure (e.g. unsupported platform)
-    // is not fatal.
+    // cache and memtables.
+    //
+    // memmap2 gates `Advice`/`advise` on unix (they wrap madvise), so an
+    // unsupported platform is a *compile* error, not the runtime `Err` the
+    // best-effort handling below suggests -- hence the cfg. Without it osmflatc
+    // does not build for Windows at all.
+    #[cfg(unix)]
     if let Err(e) = input_data.advise(memmap2::Advice::Sequential) {
         log::warn!("madvise(MADV_SEQUENTIAL) on input failed, continuing: {e}");
     }
@@ -97,7 +102,7 @@ pub fn run(args: Args) -> Result<(), Error> {
 
     info!(
         "Initialized new osmflat archive at: {}",
-        &args.output.display()
+        args.output.display()
     );
 
     info!("Building index of PBF blocks...");
