@@ -7,7 +7,9 @@ use rocksdb::{
     IteratorMode, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
-use way::storage::{ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayRefByNodeTDC, WayTDC};
+use way::storage::{
+    WayByIdTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayNodeRefTDC, WayNodeResolvedTDC, WayTDC,
+};
 
 use crate::error::OsmFlatcError;
 use relation::storage::{
@@ -315,11 +317,12 @@ pub fn create_db(
         WayTDC::NAME,
         WayIdToMbbTDC::NAME,
         WayIdToIdxTDC::NAME,
-        // Temporary indexes for the way-ordering pass's sort-merge join (see
-        // way.rs) -- same bulk-load lifecycle as everything else above: one
-        // pass writes each fully, the next only reads it.
-        WayRefByNodeTDC::NAME,
-        ResolvedRefTDC::NAME,
+        // Staging and temporary indexes for the way pass's sort-merge join
+        // (see way.rs) -- same bulk-load lifecycle as everything else above:
+        // one pass writes each fully, the next only reads it.
+        WayByIdTDC::NAME,
+        WayNodeRefTDC::NAME,
+        WayNodeResolvedTDC::NAME,
         RELATIONS,
         // Temporary indexes for the relation-member ordering pass's
         // sort-merge join (see relation.rs) -- same bulk-load lifecycle.

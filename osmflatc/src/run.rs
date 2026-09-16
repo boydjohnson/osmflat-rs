@@ -177,7 +177,7 @@ pub fn run(args: Args) -> Result<(), Error> {
     // open-file limit, which the caller raises with `ulimit -n` as needed.
     info!("RocksDB max_open_files: {}", args.max_open_files);
 
-    let (db, scratch, db_opts) = {
+    let (db, scratch, _db_opts) = {
         let _t = PhaseTimer::start("create_db");
         create_db(
             scratch_parent,
@@ -250,7 +250,6 @@ pub fn run(args: Args) -> Result<(), Error> {
         serialize_way_blocks(
             &builder,
             &db,
-            &db_opts,
             &node_locations,
             way_ids,
             way_by_id,
