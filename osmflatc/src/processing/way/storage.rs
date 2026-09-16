@@ -20,8 +20,8 @@ impl WayValue {
     }
 }
 
-impl From<Box<[u8]>> for WayValue {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for WayValue {
+    fn from(bytes: &[u8]) -> Self {
         let num = u64::from_be_bytes(bytes[..8].try_into().unwrap()) as usize;
         let node_refs = bytes[8..]
             .chunks(8)
@@ -47,9 +47,7 @@ impl From<Box<[u8]>> for WayValue {
 }
 
 impl Value for WayValue {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 * self.node_refs.len() + 16 * self.key_vals.len() + 8);
-
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         let num = self.node_refs.len() as u64;
 
         out.extend(num.to_be_bytes());
@@ -62,8 +60,6 @@ impl Value for WayValue {
             out.extend(k.to_be_bytes());
             out.extend(v.to_be_bytes());
         }
-
-        out
     }
 }
 
@@ -103,8 +99,8 @@ impl ResolvedWayValue {
     }
 }
 
-impl From<Box<[u8]>> for ResolvedWayValue {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for ResolvedWayValue {
+    fn from(bytes: &[u8]) -> Self {
         let num_refs = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let num_missing = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let mut rest = &bytes[8..];
@@ -145,12 +141,7 @@ impl From<Box<[u8]>> for ResolvedWayValue {
 }
 
 impl Value for ResolvedWayValue {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            8 + 8 * self.node_idxs.len()
-                + 8 * self.missing_node_ids.len()
-                + 16 * self.key_vals.len(),
-        );
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend((self.node_idxs.len() as u32).to_be_bytes());
         out.extend((self.missing_node_ids.len() as u32).to_be_bytes());
         for idx in &self.node_idxs {
@@ -163,7 +154,6 @@ impl Value for ResolvedWayValue {
             out.extend(k.to_be_bytes());
             out.extend(v.to_be_bytes());
         }
-        out
     }
 }
 
@@ -198,17 +188,15 @@ impl WayMbbValue {
 }
 
 impl Value for WayMbbValue {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 * self.mbb.len());
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         for m in &self.mbb {
             out.extend(m.to_be_bytes());
         }
-        out
     }
 }
 
-impl From<Box<[u8]>> for WayMbbValue {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for WayMbbValue {
+    fn from(bytes: &[u8]) -> Self {
         WayMbbValue {
             mbb: bytes
                 .chunks(4)
@@ -249,17 +237,15 @@ impl WayNodeRefKey {
 }
 
 impl Key for WayNodeRefKey {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(20);
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend(self.node_id.to_be_bytes());
         out.extend(self.way_id.to_be_bytes());
         out.extend(self.pos.to_be_bytes());
-        out
     }
 }
 
-impl From<Box<[u8]>> for WayNodeRefKey {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for WayNodeRefKey {
+    fn from(bytes: &[u8]) -> Self {
         Self {
             node_id: i64::from_be_bytes(bytes[0..8].try_into().unwrap()),
             way_id: i64::from_be_bytes(bytes[8..16].try_into().unwrap()),
@@ -293,16 +279,14 @@ impl WayPosKey {
 }
 
 impl Key for WayPosKey {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(12);
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend(self.way_id.to_be_bytes());
         out.extend(self.pos.to_be_bytes());
-        out
     }
 }
 
-impl From<Box<[u8]>> for WayPosKey {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for WayPosKey {
+    fn from(bytes: &[u8]) -> Self {
         Self {
             way_id: i64::from_be_bytes(bytes[0..8].try_into().unwrap()),
             pos: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
@@ -327,19 +311,17 @@ impl ResolvedNodeValue {
 }
 
 impl Value for ResolvedNodeValue {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16);
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend(self.idx.unwrap_or(UNRESOLVED_IDX).to_be_bytes());
         if let Some((lon, lat)) = self.location {
             out.extend(lon.to_be_bytes());
             out.extend(lat.to_be_bytes());
         }
-        out
     }
 }
 
-impl From<Box<[u8]>> for ResolvedNodeValue {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for ResolvedNodeValue {
+    fn from(bytes: &[u8]) -> Self {
         let idx = match u64::from_be_bytes(bytes[0..8].try_into().unwrap()) {
             UNRESOLVED_IDX => None,
             idx => Some(idx),
@@ -368,7 +350,7 @@ mod tests {
     use super::*;
 
     fn roundtrip<V: Value>(v: &V) -> V {
-        V::from(v.serialize().into_boxed_slice())
+        V::from(v.serialize().as_slice())
     }
 
     #[test]
@@ -403,12 +385,12 @@ mod tests {
     fn way_keys_roundtrip_and_sort_by_leading_field() {
         let a = WayNodeRefKey::new(5, 900, 3);
         let b = WayNodeRefKey::new(6, 1, 0);
-        assert_eq!(WayNodeRefKey::from(a.serialize().into_boxed_slice()), a);
+        assert_eq!(WayNodeRefKey::from(a.serialize().as_slice()), a);
         assert!(a.serialize() < b.serialize());
 
         let c = WayPosKey::new(10, 2);
         let d = WayPosKey::new(10, 11);
-        assert_eq!(WayPosKey::from(c.serialize().into_boxed_slice()), c);
+        assert_eq!(WayPosKey::from(c.serialize().as_slice()), c);
         assert!(c.serialize() < d.serialize());
     }
 }

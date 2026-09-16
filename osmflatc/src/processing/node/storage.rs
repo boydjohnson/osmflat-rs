@@ -16,8 +16,8 @@ impl NodeValue {
     }
 }
 
-impl From<Box<[u8]>> for NodeValue {
-    fn from(bytes: Box<[u8]>) -> Self {
+impl From<&[u8]> for NodeValue {
+    fn from(bytes: &[u8]) -> Self {
         // Layout: lon (i32 LE), lat (i32 LE), then 16-byte (key, value) ref pairs.
         // Coordinates are stored inline so the spatial-ordering pass can read
         // them straight from this sequential scan instead of doing a random
@@ -37,15 +37,13 @@ impl From<Box<[u8]>> for NodeValue {
 }
 
 impl Value for NodeValue {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 16 * self.refs.len());
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend(&self.lon.to_le_bytes());
         out.extend(&self.lat.to_le_bytes());
         for &(key, value) in &self.refs {
             out.extend(&key.to_le_bytes());
             out.extend(&value.to_le_bytes());
         }
-        out
     }
 }
 
@@ -71,16 +69,14 @@ impl NodeLonLatValue {
 }
 
 impl Value for NodeLonLatValue {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8);
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.lon.to_be_bytes());
         out.extend_from_slice(&self.lat.to_be_bytes());
-        out
     }
 }
 
-impl From<Box<[u8]>> for NodeLonLatValue {
-    fn from(value: Box<[u8]>) -> Self {
+impl From<&[u8]> for NodeLonLatValue {
+    fn from(value: &[u8]) -> Self {
         let lon = i32::from_be_bytes(value[0..4].try_into().unwrap());
         let lat = i32::from_be_bytes(value[4..8].try_into().unwrap());
         NodeLonLatValue::new(lon, lat)
@@ -115,7 +111,7 @@ mod tests {
     #[test]
     fn node_value_roundtrips_with_coords_and_tags() {
         let v = NodeValue::new(-180_000_000, 90_000_000, vec![(1, 2), (3, 4)]);
-        let back = NodeValue::from(v.serialize().into_boxed_slice());
+        let back = NodeValue::from(v.serialize().as_slice());
         assert_eq!(back.lon, -180_000_000);
         assert_eq!(back.lat, 90_000_000);
         assert_eq!(back.refs, vec![(1, 2), (3, 4)]);
@@ -123,7 +119,7 @@ mod tests {
 
     #[test]
     fn node_value_roundtrips_without_tags() {
-        let back = NodeValue::from(NodeValue::new(7, -7, vec![]).serialize().into_boxed_slice());
+        let back = NodeValue::from(NodeValue::new(7, -7, vec![]).serialize().as_slice());
         assert_eq!((back.lon, back.lat), (7, -7));
         assert!(back.refs.is_empty());
     }

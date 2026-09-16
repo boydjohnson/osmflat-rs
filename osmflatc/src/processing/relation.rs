@@ -401,7 +401,7 @@ pub fn serialize_relation_blocks(
             .enumerate()
         {
             let (key, _) = res?;
-            relation_id_to_idx.insert(OsmKey::from(key).id, idx as u64);
+            relation_id_to_idx.insert(OsmKey::from(&key[..]).id, idx as u64);
         }
     }
 
@@ -586,7 +586,7 @@ pub fn serialize_relation_blocks(
     for res in db.iterator_cf(relations_cf, rocksdb::IteratorMode::Start) {
         let (key, rel) = res?;
 
-        let id = OsmKey::from(key).id;
+        let id = OsmKey::from(&key[..]).id;
         let (relation, string_refs) = decode_relation(&rel)?;
 
         // Relations without resolvable member geometry carry the sentinel bbox.

@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::path::Path;
 
 use node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodesTDC};
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, Env,
-    IteratorMode, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions,
+    DBRawIterator, Env, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
 use way::storage::{
@@ -29,12 +30,26 @@ pub mod way;
 /// read pipeline full, small enough to not matter on an 8GB laptop.
 const READAHEAD_BYTES: usize = 4 * 1024 * 1024;
 
-pub trait Key: From<Box<[u8]>> {
-    fn serialize(&self) -> Vec<u8>;
+pub trait Key: for<'a> From<&'a [u8]> {
+    /// Append the encoded key to `out`.
+    fn serialize_into(&self, out: &mut Vec<u8>);
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out);
+        out
+    }
 }
 
-pub trait Value: From<Box<[u8]>> {
-    fn serialize(&self) -> Vec<u8>;
+pub trait Value: for<'a> From<&'a [u8]> {
+    /// Append the encoded value to `out`.
+    fn serialize_into(&self, out: &mut Vec<u8>);
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out);
+        out
+    }
 }
 
 pub trait TempDataCodec {
@@ -63,6 +78,10 @@ pub trait RocksDBSync {
 pub struct WriteBatchInternal<'a> {
     batch: WriteBatch,
     families: BTreeMap<String, &'a ColumnFamily>,
+    // Reused encode buffers: `WriteBatch` copies each put, so there is no
+    // need for a fresh allocation per key and value.
+    key_buf: Vec<u8>,
+    value_buf: Vec<u8>,
 }
 
 impl<'a> WriteBatchInternal<'a> {
@@ -78,7 +97,11 @@ impl<'a> WriteBatchInternal<'a> {
 impl<'a> RocksDBUnsync for WriteBatchInternal<'a> {
     fn put<TDC: TempDataCodec>(&mut self, key: TDC::Key, value: TDC::Value) {
         let fam = self.families.get(TDC::NAME).unwrap();
-        self.batch.put_cf(fam, key.serialize(), value.serialize());
+        self.key_buf.clear();
+        key.serialize_into(&mut self.key_buf);
+        self.value_buf.clear();
+        value.serialize_into(&mut self.value_buf);
+        self.batch.put_cf(fam, &self.key_buf, &self.value_buf);
     }
 }
 
@@ -101,7 +124,7 @@ impl RocksDBSync for DB {
 
         self.get_cf(cf, key.serialize())
             .map_err(OsmFlatcError::RocksDB)
-            .map(|v| v.map(|b| TDC::Value::from(b.into())))
+            .map(|v| v.map(|b| TDC::Value::from(&b[..])))
     }
 
     fn multi_get<TDC: TempDataCodec>(
@@ -115,7 +138,7 @@ impl RocksDBSync for DB {
             .into_iter()
             .map(|res| {
                 res.map_err(OsmFlatcError::RocksDB)
-                    .map(|opt| opt.map(|slice| TDC::Value::from(Box::<[u8]>::from(slice.as_ref()))))
+                    .map(|opt| opt.map(|slice| TDC::Value::from(slice.as_ref())))
             })
             .collect()
     }
@@ -143,11 +166,41 @@ impl RocksDB for DB {
         let mut read_opts = ReadOptions::default();
         read_opts.set_readahead_size(READAHEAD_BYTES);
 
-        let iter = self.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
-        Ok(Box::new(iter.map(|res| {
-            res.map_err(OsmFlatcError::RocksDB)
-                .map(|(k, v)| (TDC::Key::from(k), TDC::Value::from(v)))
-        })))
+        let mut raw = self.raw_iterator_cf_opt(cf, read_opts);
+        raw.seek_to_first();
+        Ok(Box::new(DecodingIter::<TDC::Key, TDC::Value> {
+            raw,
+            first: true,
+            _codec: PhantomData,
+        }))
+    }
+}
+
+/// Full-scan iterator that decodes each entry straight from the raw
+/// iterator's borrowed key/value slices. The plain RocksDB iterator copies
+/// every key and value into a fresh `Box<[u8]>` first; for the ordering
+/// passes' scans over hundreds of millions of fixed-width entries that
+/// allocate/free pair was the dominant CPU cost.
+struct DecodingIter<'a, K, V> {
+    raw: DBRawIterator<'a>,
+    first: bool,
+    _codec: PhantomData<fn() -> (K, V)>,
+}
+
+impl<K: Key, V: Value> Iterator for DecodingIter<'_, K, V> {
+    type Item = Result<(K, V), OsmFlatcError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !std::mem::take(&mut self.first) {
+            if !self.raw.valid() {
+                return None;
+            }
+            self.raw.next();
+        }
+        match self.raw.item() {
+            Some((k, v)) => Some(Ok((K::from(k), V::from(v)))),
+            None => self.raw.status().err().map(|e| Err(e.into())),
+        }
     }
 }
 
@@ -403,5 +456,37 @@ mod create_db_tests {
 
         let got = db.get_cf(cf, key).unwrap();
         assert_eq!(got.as_deref(), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
+    }
+
+    /// The decoding full-scan iterator yields every entry once, in key order,
+    /// and stays exhausted; an empty column family yields nothing.
+    #[test]
+    fn iterator_scans_in_key_order() {
+        use storage::{OsmIdKey, OsmIdxValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _scratch, _db_opts) =
+            create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
+
+        assert!(<DB as RocksDB>::iterator::<NodeIdToIdxTDC>(&db)
+            .unwrap()
+            .next()
+            .is_none());
+
+        let mut batch = WriteBatchInternal::default();
+        batch.insert_cf(NodeIdToIdxTDC::NAME, db.cf_handle(NodeIdToIdxTDC::NAME).unwrap());
+        for id in [30, 10, 20] {
+            batch.put::<NodeIdToIdxTDC>(OsmIdKey::new(id), OsmIdxValue::new(id as u64 * 2));
+        }
+        write_batch_no_wal(&db, batch.inner()).unwrap();
+        finalize_bulk_cfs(&db, &[NodeIdToIdxTDC::NAME]).unwrap();
+
+        let mut iter = <DB as RocksDB>::iterator::<NodeIdToIdxTDC>(&db).unwrap();
+        let got: Vec<(i64, u64)> = iter
+            .by_ref()
+            .map(|r| r.map(|(k, v)| (k.id, v.idx)).unwrap())
+            .collect();
+        assert_eq!(got, vec![(10, 20), (20, 40), (30, 60)]);
+        assert!(iter.next().is_none());
     }
 }
