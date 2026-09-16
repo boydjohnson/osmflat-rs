@@ -42,8 +42,9 @@ LOG="$RESULTS_DIR/${LABEL}-${TS}.log"
 IOSTAT_LOG="$RESULTS_DIR/${LABEL}-${TS}.iostat.log"
 CSV="$RESULTS_DIR/timings.csv"
 
-BIN="$REPO_ROOT/target/release/osmflatc"
-if [[ ! -x "$BIN" ]]; then
+# Override with OSMFLATC_BIN to bench another build, e.g. target/dist/osmflatc.
+BIN="${OSMFLATC_BIN:-$REPO_ROOT/target/release/osmflatc}"
+if [[ -z "${OSMFLATC_BIN:-}" && ! -x "$BIN" ]]; then
     echo "Building release osmflatc..." >&2
     (cd "$REPO_ROOT" && cargo build --release -p osmflatc)
 fi
