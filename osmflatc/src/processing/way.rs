@@ -5,8 +5,9 @@ use crate::{
     osmpbf::{self, read_block, BlockIndex},
     processing::{
         node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodeLonLatValue},
+        key_ranges, range_iterator,
         storage::{EmptyValue, OsmIdKey, OsmIdxValue, OsmKey},
-        NodeLocations, RocksDB, RocksDBUnsync, TempDataCodec,
+        KeyRange, NodeLocations, RocksDB, RocksDBUnsync, TempDataCodec,
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
@@ -127,7 +128,7 @@ fn resolve_way(
 /// Advance a forward-only node-id-keyed scan until `cur` is the first entry
 /// with id >= `id`. Callers must ask for non-decreasing ids.
 fn seek_forward<V>(
-    iter: &mut dyn Iterator<Item = Result<(OsmIdKey, V), OsmFlatcError>>,
+    iter: &mut impl Iterator<Item = Result<(OsmIdKey, V), OsmFlatcError>>,
     cur: &mut Option<(OsmIdKey, V)>,
     id: i64,
 ) -> Result<(), OsmFlatcError> {
@@ -137,20 +138,46 @@ fn seek_forward<V>(
     Ok(())
 }
 
+/// Number of key ranges a parallel scan is split into: several per worker,
+/// so an unevenly dense range does not leave the other workers idle.
+fn parallel_scan_ranges() -> usize {
+    rayon::current_num_threads() * 4
+}
+
 /// Phase 1 of the way pass (see `serialize_way_blocks`): merge-join the
 /// node-id-sorted ref index against the node stores, writing each resolved ref
-/// keyed by (way id, position). Called once; kept out of line so profiles
-/// attribute it separately.
+/// keyed by (way id, position).
+///
+/// Every input is sorted by node id, so the node-id space is split into
+/// ranges joined independently in parallel; a node id's refs and its node
+/// entries always fall in the same range. Output order does not matter, since
+/// the output family is compacted before it is read. Kept out of line so
+/// profiles attribute it separately.
 #[inline(never)]
 fn join_way_node_refs(db: &DB, node_locations: &NodeLocations) -> Result<(), OsmFlatcError> {
     let _t = PhaseTimer::start("ways_join_nodes");
-    let mut idx_iter = <DB as RocksDB>::iterator::<NodeIdToIdxTDC>(db)?;
+    let ranges = key_ranges(db, WayNodeRefTDC::NAME, 8, parallel_scan_ranges())?;
+    let (refs_seen, resolved_count) = ranges
+        .par_iter()
+        .map(|range| join_way_node_refs_range(db, node_locations, range))
+        .try_reduce(|| (0, 0), |a, b| Ok((a.0 + b.0, a.1 + b.1)))?;
+    log::debug!(
+        "[ways_join_nodes] ranges={} refs={refs_seen} resolved={resolved_count}",
+        ranges.len()
+    );
+    Ok(())
+}
+
+/// Join the refs whose node id falls in `range`; returns (refs, resolved).
+fn join_way_node_refs_range(
+    db: &DB,
+    node_locations: &NodeLocations,
+    range: &KeyRange,
+) -> Result<(u64, u64), OsmFlatcError> {
+    let mut idx_iter = range_iterator::<NodeIdToIdxTDC>(db, range);
     let mut idx_cur: Option<(OsmIdKey, OsmIdxValue)> = idx_iter.next().transpose()?;
     let (mut loc_iter, flat) = match node_locations {
-        NodeLocations::Rocks(db) => (
-            Some(<DB as RocksDB>::iterator::<NodeIdToLonLatTDC>(db)?),
-            None,
-        ),
+        NodeLocations::Rocks(db) => (Some(range_iterator::<NodeIdToLonLatTDC>(db, range)), None),
         NodeLocations::Flat(flat) => (None, Some(*flat)),
     };
     let mut loc_cur: Option<(OsmIdKey, NodeLonLatValue)> = match &mut loc_iter {
@@ -163,18 +190,18 @@ fn join_way_node_refs(db: &DB, node_locations: &NodeLocations) -> Result<(), Osm
     batch.insert_cf(WayNodeResolvedTDC::NAME, resolved_cf);
     let mut refs_seen: u64 = 0;
     let mut resolved_count: u64 = 0;
-    for r in <DB as RocksDB>::iterator::<WayNodeRefTDC>(db)? {
+    for r in range_iterator::<WayNodeRefTDC>(db, range) {
         let (ref_key, _) = r?;
         let node_id = ref_key.node_id;
 
-        seek_forward(&mut *idx_iter, &mut idx_cur, node_id)?;
+        seek_forward(&mut idx_iter, &mut idx_cur, node_id)?;
         let idx = match &idx_cur {
             Some((key, val)) if key.id == node_id => Some(val.idx),
             _ => None,
         };
         let location = match (&mut loc_iter, flat) {
             (Some(it), _) => {
-                seek_forward(&mut **it, &mut loc_cur, node_id)?;
+                seek_forward(it, &mut loc_cur, node_id)?;
                 match &loc_cur {
                     Some((key, val)) if key.id == node_id => Some((val.lon, val.lat)),
                     _ => None,
@@ -201,18 +228,35 @@ fn join_way_node_refs(db: &DB, node_locations: &NodeLocations) -> Result<(), Osm
         }
     }
     write_batch_no_wal(db, batch.inner())?;
-    log::debug!("[ways_join_nodes] refs={refs_seen} resolved={resolved_count}");
-    Ok(())
+    Ok((refs_seen, resolved_count))
 }
 
 /// Phase 2 of the way pass (see `serialize_way_blocks`): merge staged ways
 /// with their resolved refs, compute spatial keys, and write `WayTDC` and
-/// `WayIdToMbbTDC`. Called once; kept out of line so profiles attribute it
-/// separately.
+/// `WayIdToMbbTDC`.
+///
+/// Both inputs are sorted by way id, so the way-id space is split into ranges
+/// processed independently in parallel, like the join. Kept out of line so
+/// profiles attribute it separately.
 #[inline(never)]
 fn compute_way_bboxes(db: &DB, num_ways: usize, coord_scale: i32) -> Result<(), OsmFlatcError> {
     let _t = PhaseTimer::start("ways_bbox");
     let pb = Progress::new(num_ways as u64, "Computing way bounding boxes");
+    let ranges = key_ranges(db, WayNodeResolvedTDC::NAME, 8, parallel_scan_ranges())?;
+    ranges
+        .par_iter()
+        .try_for_each(|range| compute_way_bboxes_range(db, range, coord_scale, &pb))?;
+    pb.finish();
+    Ok(())
+}
+
+/// Compute bounding boxes for the ways whose id falls in `range`.
+fn compute_way_bboxes_range(
+    db: &DB,
+    range: &KeyRange,
+    coord_scale: i32,
+    pb: &Progress,
+) -> Result<(), OsmFlatcError> {
     let curve = osmflat::way_curve();
 
     let way_cf = db.cf_handle(WayTDC::NAME).unwrap();
@@ -225,11 +269,12 @@ fn compute_way_bboxes(db: &DB, num_ways: usize, coord_scale: i32) -> Result<(), 
     };
     let mut batch = new_batch();
 
-    let mut resolved_iter = <DB as RocksDB>::iterator::<WayNodeResolvedTDC>(db)?;
+    let mut resolved_iter = range_iterator::<WayNodeResolvedTDC>(db, range);
     let mut resolved_cur: Option<(WayPosKey, ResolvedNodeValue)> =
         resolved_iter.next().transpose()?;
     let mut resolved = Vec::new();
-    for (i, r) in <DB as RocksDB>::iterator::<WayByIdTDC>(db)?.enumerate() {
+    let mut ways_seen: usize = 0;
+    for r in range_iterator::<WayByIdTDC>(db, range) {
         let (way_key, way) = r?;
         let way_id = way_key.id;
 
@@ -249,14 +294,17 @@ fn compute_way_bboxes(db: &DB, num_ways: usize, coord_scale: i32) -> Result<(), 
             batch.put::<WayIdToMbbTDC>(way_key, mbb);
         }
 
-        pb.inc(1);
-        if (i + 1).is_multiple_of(BATCH_SIZE) {
+        ways_seen += 1;
+        if ways_seen.is_multiple_of(BATCH_SIZE) {
             write_batch_no_wal(db, batch.inner())?;
             batch = new_batch();
+            // Per batch, not per way: `inc` can take a lock, and this runs
+            // on every worker.
+            pb.inc(BATCH_SIZE as u64);
         }
     }
     write_batch_no_wal(db, batch.inner())?;
-    pb.finish();
+    pb.inc((ways_seen % BATCH_SIZE) as u64);
     Ok(())
 }
 

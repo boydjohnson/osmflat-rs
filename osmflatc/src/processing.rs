@@ -155,25 +155,115 @@ impl RocksDB for DB {
         <TDC as TempDataCodec>::Key: 'a,
         <TDC as TempDataCodec>::Value: 'a,
     {
-        let cf = self.cf_handle(TDC::NAME).unwrap();
-
-        // This drives the ordering passes' full column-family scans. With the
-        // default `ReadOptions` (readahead disabled) every block is a
-        // synchronous fetch at queue depth 1 -- on fast NVMe that leaves most
-        // of the drive's IOPS/bandwidth unused and the process CPU-idle,
-        // since nothing overlaps the reads. A forward readahead window lets
-        // RocksDB prefetch ahead of the iterator instead.
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_readahead_size(READAHEAD_BYTES);
-
-        let mut raw = self.raw_iterator_cf_opt(cf, read_opts);
-        raw.seek_to_first();
-        Ok(Box::new(DecodingIter::<TDC::Key, TDC::Value> {
-            raw,
-            first: true,
-            _codec: PhantomData,
-        }))
+        Ok(Box::new(range_iterator::<TDC>(self, &KeyRange::FULL)))
     }
+}
+
+/// A contiguous span of a column family's key space: `lower` inclusive,
+/// `upper` exclusive, `None` meaning unbounded.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct KeyRange {
+    pub lower: Option<Vec<u8>>,
+    pub upper: Option<Vec<u8>>,
+}
+
+impl KeyRange {
+    pub const FULL: KeyRange = KeyRange {
+        lower: None,
+        upper: None,
+    };
+}
+
+/// Scan the entries of `TDC`'s column family that fall in `range`, in key
+/// order. Bounds are compared bytewise, so a bound may be a key prefix: e.g.
+/// the 8-byte encoding of an id bounds both id-keyed families and families
+/// whose keys start with that id.
+pub(crate) fn range_iterator<'a, TDC: TempDataCodec>(
+    db: &'a DB,
+    range: &KeyRange,
+) -> impl Iterator<Item = Result<(TDC::Key, TDC::Value), OsmFlatcError>> + 'a
+where
+    TDC::Key: 'a,
+    TDC::Value: 'a,
+{
+    let cf = db.cf_handle(TDC::NAME).unwrap();
+
+    // This drives the ordering passes' column-family scans. With the default
+    // `ReadOptions` (readahead disabled) every block is a synchronous fetch
+    // at queue depth 1 -- on fast NVMe that leaves most of the drive's
+    // IOPS/bandwidth unused and the process CPU-idle, since nothing overlaps
+    // the reads. A forward readahead window lets RocksDB prefetch ahead of
+    // the iterator instead.
+    let mut read_opts = ReadOptions::default();
+    read_opts.set_readahead_size(READAHEAD_BYTES);
+    if let Some(lower) = &range.lower {
+        read_opts.set_iterate_lower_bound(lower.clone());
+    }
+    if let Some(upper) = &range.upper {
+        read_opts.set_iterate_upper_bound(upper.clone());
+    }
+
+    let mut raw = db.raw_iterator_cf_opt(cf, read_opts);
+    raw.seek_to_first();
+    DecodingIter::<TDC::Key, TDC::Value> {
+        raw,
+        first: true,
+        _codec: PhantomData,
+    }
+}
+
+/// Split a compacted column family's key space into at most `max_ranges`
+/// contiguous ranges of roughly equal size, for scanning in parallel.
+///
+/// Boundaries come from the start keys of the family's SST files (all
+/// similarly sized after `finalize_bulk_cfs`), truncated to `prefix_len`
+/// bytes so that entries sharing a key prefix -- e.g. all refs to one node
+/// id -- always land in the same range. The ranges tile the whole key space
+/// whatever the file layout, so balance depends on it but correctness does
+/// not.
+pub(crate) fn key_ranges(
+    db: &DB,
+    cf_name: &str,
+    prefix_len: usize,
+    max_ranges: usize,
+) -> Result<Vec<KeyRange>, rocksdb::Error> {
+    let mut starts: Vec<Vec<u8>> = db
+        .live_files()?
+        .into_iter()
+        .filter(|f| f.column_family_name == cf_name)
+        .filter_map(|f| f.start_key)
+        .map(|mut k| {
+            k.truncate(prefix_len);
+            k
+        })
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    // The smallest start key begins the first range, which is unbounded below.
+    if !starts.is_empty() {
+        starts.remove(0);
+    }
+
+    let wanted = max_ranges.max(1) - 1;
+    let boundaries: Vec<Vec<u8>> = if starts.len() <= wanted {
+        starts
+    } else {
+        (1..=wanted)
+            .map(|i| starts[i * starts.len() / (wanted + 1)].clone())
+            .collect()
+    };
+
+    let mut ranges = Vec::with_capacity(boundaries.len() + 1);
+    let mut lower = None;
+    for b in boundaries {
+        ranges.push(KeyRange {
+            lower,
+            upper: Some(b.clone()),
+        });
+        lower = Some(b);
+    }
+    ranges.push(KeyRange { lower, upper: None });
+    Ok(ranges)
 }
 
 /// Full-scan iterator that decodes each entry straight from the raw
@@ -488,5 +578,56 @@ mod create_db_tests {
             .collect();
         assert_eq!(got, vec![(10, 20), (20, 40), (30, 60)]);
         assert!(iter.next().is_none());
+    }
+
+    /// `key_ranges` splits at SST start keys (truncated to the prefix), and
+    /// scanning its ranges visits every entry exactly once, in order -- with
+    /// all entries sharing a prefix in the same range.
+    #[test]
+    fn key_ranges_tile_the_key_space() {
+        use way::storage::{WayNodeRefKey, WayNodeRefTDC};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _scratch, _db_opts) =
+            create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
+        let cf = db.cf_handle(WayNodeRefTDC::NAME).unwrap();
+
+        // Three flushes of disjoint node-id spans give three SST files. Each
+        // node id is referenced by two ways so prefix grouping is exercised.
+        let mut expected = Vec::new();
+        for span in [0..100i64, 100..200, 200..300] {
+            let mut batch = WriteBatchInternal::default();
+            batch.insert_cf(WayNodeRefTDC::NAME, cf);
+            for node_id in span {
+                for way_id in [7, 9] {
+                    let key = WayNodeRefKey::new(node_id, way_id, 0);
+                    batch.put::<WayNodeRefTDC>(key, storage::EmptyValue);
+                    expected.push(key);
+                }
+            }
+            write_batch_no_wal(&db, batch.inner()).unwrap();
+            db.flush_cf(cf).unwrap();
+        }
+
+        let ranges = key_ranges(&db, WayNodeRefTDC::NAME, 8, 16).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].lower, None);
+        assert_eq!(ranges[0].upper, Some(100i64.to_be_bytes().to_vec()));
+        assert_eq!(ranges[2].upper, None);
+
+        let scanned: Vec<WayNodeRefKey> = ranges
+            .iter()
+            .flat_map(|r| range_iterator::<WayNodeRefTDC>(&db, r).map(|e| e.unwrap().0))
+            .collect();
+        assert_eq!(scanned, expected);
+
+        // Capping the range count still tiles the space.
+        let capped = key_ranges(&db, WayNodeRefTDC::NAME, 8, 2).unwrap();
+        assert_eq!(capped.len(), 2);
+        let total: usize = capped
+            .iter()
+            .map(|r| range_iterator::<WayNodeRefTDC>(&db, r).count())
+            .sum();
+        assert_eq!(total, expected.len());
     }
 }
