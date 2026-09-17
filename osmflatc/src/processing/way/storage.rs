@@ -1,4 +1,5 @@
 use crate::processing::{
+    node::storage::NodeIdxLocValue,
     storage::{EmptyValue, OsmIdKey, OsmIdxValue, OsmKey},
     Key, TempDataCodec, Value,
 };
@@ -216,7 +217,7 @@ impl TempDataCodec for WayIdToMbbTDC {
 }
 
 /// One way->node reference, keyed so a full scan visits refs in ascending
-/// *node id* order -- the order of `NodeIdToIdx` and `NodeIdToLonLat` -- for
+/// *node id* order -- the order of `NodeIdToIdx` -- for
 /// the way pass's sort-merge join. `way_id` and `pos` (the ref's position in
 /// the way) route the resolved node back to its slot.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -294,47 +295,9 @@ impl From<&[u8]> for WayPosKey {
     }
 }
 
-/// A resolved way->node ref: the node's archive index and/or its location.
-/// Both come from node-id-keyed stores written for every node, so in practice
-/// both are present; each is optional so a ref present in only one store
-/// behaves exactly as the separate lookups did before.
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub struct ResolvedNodeValue {
-    pub idx: Option<u64>,
-    pub location: Option<(i32, i32)>,
-}
-
-impl ResolvedNodeValue {
-    pub fn new(idx: Option<u64>, location: Option<(i32, i32)>) -> Self {
-        Self { idx, location }
-    }
-}
-
-impl Value for ResolvedNodeValue {
-    fn serialize_into(&self, out: &mut Vec<u8>) {
-        out.extend(self.idx.unwrap_or(UNRESOLVED_IDX).to_be_bytes());
-        if let Some((lon, lat)) = self.location {
-            out.extend(lon.to_be_bytes());
-            out.extend(lat.to_be_bytes());
-        }
-    }
-}
-
-impl From<&[u8]> for ResolvedNodeValue {
-    fn from(bytes: &[u8]) -> Self {
-        let idx = match u64::from_be_bytes(bytes[0..8].try_into().unwrap()) {
-            UNRESOLVED_IDX => None,
-            idx => Some(idx),
-        };
-        let location = (bytes.len() >= 16).then(|| {
-            (
-                i32::from_be_bytes(bytes[8..12].try_into().unwrap()),
-                i32::from_be_bytes(bytes[12..16].try_into().unwrap()),
-            )
-        });
-        Self { idx, location }
-    }
-}
+/// A resolved way->node ref: the node's archive index and location. Refs to
+/// nodes absent from the archive have no entry.
+pub type ResolvedNodeValue = NodeIdxLocValue;
 
 pub struct WayNodeResolvedTDC;
 
@@ -367,18 +330,6 @@ mod tests {
 
         let empty = roundtrip(&ResolvedWayValue::new(vec![], vec![], vec![]));
         assert!(empty.node_idxs.is_empty() && empty.key_vals.is_empty());
-    }
-
-    #[test]
-    fn resolved_node_value_roundtrips() {
-        for v in [
-            ResolvedNodeValue::new(Some(7), Some((-180_000_000, 90_000_000))),
-            ResolvedNodeValue::new(None, Some((0, 0))),
-            ResolvedNodeValue::new(Some(7), None),
-            ResolvedNodeValue::new(None, None),
-        ] {
-            assert_eq!(roundtrip(&v), v);
-        }
     }
 
     #[test]

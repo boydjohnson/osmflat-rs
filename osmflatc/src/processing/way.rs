@@ -4,10 +4,10 @@ use crate::{
     add_string_table,
     osmpbf::{self, read_block, BlockIndex},
     processing::{
-        node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodeLonLatValue},
+        node::storage::{NodeIdToIdxTDC, NodeIdxLocValue},
         key_ranges, range_iterator,
         storage::{EmptyValue, OsmIdKey, OsmIdxValue, OsmKey},
-        KeyRange, NodeLocations, RocksDB, RocksDBUnsync, TempDataCodec,
+        KeyRange, RocksDB, RocksDBUnsync, TempDataCodec,
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
@@ -90,17 +90,15 @@ fn resolve_way(
     let mut bbox: Option<(f64, f64, f64, f64)> = None;
     for &(pos, node) in resolved {
         if let Some(slot) = node_idxs.get_mut(pos as usize) {
-            *slot = node.idx;
+            *slot = Some(node.idx);
         }
-        if let Some((lon, lat)) = node.location {
-            let (x, y) = (lon as f64 / scale, lat as f64 / scale);
-            bbox = Some(match bbox {
-                None => (x, y, x, y),
-                Some((min_x, min_y, max_x, max_y)) => {
-                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
-                }
-            });
-        }
+        let (x, y) = (node.lon as f64 / scale, node.lat as f64 / scale);
+        bbox = Some(match bbox {
+            None => (x, y, x, y),
+            Some((min_x, min_y, max_x, max_y)) => {
+                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+            }
+        });
     }
     let (min_x, min_y, max_x, max_y) = bbox?;
 
@@ -145,8 +143,8 @@ fn parallel_scan_ranges() -> usize {
 }
 
 /// Phase 1 of the way pass (see `serialize_way_blocks`): merge-join the
-/// node-id-sorted ref index against the node stores, writing each resolved ref
-/// keyed by (way id, position).
+/// node-id-sorted ref index against `NodeIdToIdx` (index and location per
+/// node), writing each resolved ref keyed by (way id, position).
 ///
 /// Every input is sorted by node id, so the node-id space is split into
 /// ranges joined independently in parallel; a node id's refs and its node
@@ -154,12 +152,12 @@ fn parallel_scan_ranges() -> usize {
 /// the output family is compacted before it is read. Kept out of line so
 /// profiles attribute it separately.
 #[inline(never)]
-fn join_way_node_refs(db: &DB, node_locations: &NodeLocations) -> Result<(), OsmFlatcError> {
+fn join_way_node_refs(db: &DB) -> Result<(), OsmFlatcError> {
     let _t = PhaseTimer::start("ways_join_nodes");
     let ranges = key_ranges(db, WayNodeRefTDC::NAME, 8, parallel_scan_ranges())?;
     let (refs_seen, resolved_count) = ranges
         .par_iter()
-        .map(|range| join_way_node_refs_range(db, node_locations, range))
+        .map(|range| join_way_node_refs_range(db, range))
         .try_reduce(|| (0, 0), |a, b| Ok((a.0 + b.0, a.1 + b.1)))?;
     log::debug!(
         "[ways_join_nodes] ranges={} refs={refs_seen} resolved={resolved_count}",
@@ -169,21 +167,9 @@ fn join_way_node_refs(db: &DB, node_locations: &NodeLocations) -> Result<(), Osm
 }
 
 /// Join the refs whose node id falls in `range`; returns (refs, resolved).
-fn join_way_node_refs_range(
-    db: &DB,
-    node_locations: &NodeLocations,
-    range: &KeyRange,
-) -> Result<(u64, u64), OsmFlatcError> {
-    let mut idx_iter = range_iterator::<NodeIdToIdxTDC>(db, range);
-    let mut idx_cur: Option<(OsmIdKey, OsmIdxValue)> = idx_iter.next().transpose()?;
-    let (mut loc_iter, flat) = match node_locations {
-        NodeLocations::Rocks(db) => (Some(range_iterator::<NodeIdToLonLatTDC>(db, range)), None),
-        NodeLocations::Flat(flat) => (None, Some(*flat)),
-    };
-    let mut loc_cur: Option<(OsmIdKey, NodeLonLatValue)> = match &mut loc_iter {
-        Some(it) => it.next().transpose()?,
-        None => None,
-    };
+fn join_way_node_refs_range(db: &DB, range: &KeyRange) -> Result<(u64, u64), OsmFlatcError> {
+    let mut node_iter = range_iterator::<NodeIdToIdxTDC>(db, range);
+    let mut node_cur: Option<(OsmIdKey, NodeIdxLocValue)> = node_iter.next().transpose()?;
 
     let resolved_cf = db.cf_handle(WayNodeResolvedTDC::NAME).unwrap();
     let mut batch = WriteBatchInternal::default();
@@ -194,31 +180,17 @@ fn join_way_node_refs_range(
         let (ref_key, _) = r?;
         let node_id = ref_key.node_id;
 
-        seek_forward(&mut idx_iter, &mut idx_cur, node_id)?;
-        let idx = match &idx_cur {
-            Some((key, val)) if key.id == node_id => Some(val.idx),
-            _ => None,
-        };
-        let location = match (&mut loc_iter, flat) {
-            (Some(it), _) => {
-                seek_forward(it, &mut loc_cur, node_id)?;
-                match &loc_cur {
-                    Some((key, val)) if key.id == node_id => Some((val.lon, val.lat)),
-                    _ => None,
-                }
-            }
-            (None, Some(flat)) => flat.get(node_id),
-            (None, None) => unreachable!(),
-        };
-
-        // A node absent from both stores gets no row: the ref is simply
+        seek_forward(&mut node_iter, &mut node_cur, node_id)?;
+        // A node absent from the archive gets no row: the ref is simply
         // unresolved when its way is assembled.
-        if idx.is_some() || location.is_some() {
-            batch.put::<WayNodeResolvedTDC>(
-                WayPosKey::new(ref_key.way_id, ref_key.pos),
-                ResolvedNodeValue::new(idx, location),
-            );
-            resolved_count += 1;
+        if let Some((key, node)) = &node_cur {
+            if key.id == node_id {
+                batch.put::<WayNodeResolvedTDC>(
+                    WayPosKey::new(ref_key.way_id, ref_key.pos),
+                    ResolvedNodeValue::new(node.idx, node.lon, node.lat),
+                );
+                resolved_count += 1;
+            }
         }
         refs_seen += 1;
         if refs_seen.is_multiple_of(BATCH_SIZE as u64) {
@@ -312,7 +284,6 @@ fn compute_way_bboxes_range(
 pub fn serialize_way_blocks(
     builder: &osmflat::OsmBuilder,
     db: &DB,
-    node_locations: &NodeLocations,
     mut way_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     way_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     blocks: Vec<BlockIndex>,
@@ -329,16 +300,13 @@ pub fn serialize_way_blocks(
 
     // A way needs its nodes twice: their locations, for the bounding box that
     // determines its spatial key, and their final archive indices, for
-    // `nodes_index`. Both used to be looked up per ref -- locations by random
-    // `NodeIdToLonLat` point gets during conversion, indices by a later
-    // sort-merge join -- and the random gets dominated this pass. Both stores
-    // are keyed by node id, so one sort-merge join now resolves both at once,
-    // all sequential I/O:
+    // `nodes_index`. `NodeIdToIdx` carries both, keyed by node id, so one
+    // sort-merge join resolves every ref with sequential I/O only, instead of
+    // a random lookup per ref:
     //   0. (parallel, per block) stage each way keyed by id, and index every
     //      node ref by (node id, way id, position).
-    //   1. merge-join that index against `NodeIdToIdx` and `NodeIdToLonLat` (or
-    //      the flat node file), writing each resolved ref keyed by (way id,
-    //      position).
+    //   1. merge-join that index against `NodeIdToIdx`, writing each resolved
+    //      ref keyed by (way id, position).
     //   2. merge the staged ways with the resolved refs (both way-id sorted),
     //      compute each way's bounding box and spatial key, and write it with
     //      its node indices inlined.
@@ -385,7 +353,7 @@ pub fn serialize_way_blocks(
     info!("Compacting staged ways and node-ref index...");
     finalize_bulk_cfs(db, &[WayByIdTDC::NAME, WayNodeRefTDC::NAME])?;
 
-    join_way_node_refs(db, node_locations)?;
+    join_way_node_refs(db)?;
     info!("Compacting resolved way node refs...");
     finalize_bulk_cfs(db, &[WayNodeResolvedTDC::NAME])?;
 

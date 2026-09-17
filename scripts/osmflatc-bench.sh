@@ -13,7 +13,7 @@
 # Example:
 #   scripts/osmflatc-bench.sh --label baseline -- \
 #       us-west-latest.osm.pbf us-west.osm.flat \
-#       --max-open-files 1000 --write-buffer-mb 4000 --block-cache-mb 4000 --flat-nodes
+#       --max-open-files 1000 --write-buffer-mb 4000 --block-cache-mb 4000
 #
 # Compare across runs:
 #   awk -F, '$1=="baseline" || $1=="readahead-4mb"' bench-results/timings.csv \

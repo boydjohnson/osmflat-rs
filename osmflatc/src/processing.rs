@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodesTDC};
+use node::storage::{NodeIdToIdxTDC, NodesTDC};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions,
     DBRawIterator, Env, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
@@ -294,27 +294,6 @@ impl<K: Key, V: Value> Iterator for DecodingIter<'_, K, V> {
     }
 }
 
-/// Backend for the id -> (lon, lat) node-location lookups performed by the
-/// way and relation passes: the `NodeIdToLonLat` RocksDB column family by
-/// default, or the flat mmap'd file when `--flat-nodes` is active.
-pub enum NodeLocations<'a> {
-    Rocks(&'a DB),
-    Flat(&'a crate::flat_nodes::FlatNodes),
-}
-
-impl NodeLocations<'_> {
-    pub fn get(&self, id: i64) -> Result<Option<(i32, i32)>, OsmFlatcError> {
-        match self {
-            NodeLocations::Rocks(db) => Ok(<DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(
-                db,
-                &storage::OsmIdKey::new(id),
-            )?
-            .map(|v| (v.lon, v.lat))),
-            NodeLocations::Flat(flat) => Ok(flat.get(id)),
-        }
-    }
-}
-
 /// Write a batch to the scratch DB with the WAL disabled.
 ///
 /// The scratch DB is a throwaway temporary database, recreated from scratch on
@@ -408,7 +387,7 @@ pub fn create_db(
     // Immutable memtables allowed to queue per column family before writes
     // stall. This is the real ceiling on *concurrent flush jobs* -- at most
     // two column families are actively written during the node/way bulk-load
-    // passes (one in `--flat-nodes` mode), so `flush_threads` below can never
+    // passes, so `flush_threads` below can never
     // be kept busier than roughly `max_write_buffer_number` per active CF.
     // Scale it with cores so bigger machines can sustain more concurrent
     // flushes, but cap it well below `flush_threads`: each unit costs
@@ -455,7 +434,6 @@ pub fn create_db(
 
     let cfs = [
         NodesTDC::NAME,
-        NodeIdToLonLatTDC::NAME,
         NodeIdToIdxTDC::NAME,
         WayTDC::NAME,
         WayIdToMbbTDC::NAME,
@@ -537,7 +515,7 @@ mod create_db_tests {
         let (db, _scratch, _db_opts) =
             create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
 
-        let cf = db.cf_handle(NodeIdToLonLatTDC::NAME).unwrap();
+        let cf = db.cf_handle(NodesTDC::NAME).unwrap();
         let key = 42i64.to_be_bytes();
         db.put_cf(cf, key, [1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
 
@@ -552,7 +530,8 @@ mod create_db_tests {
     /// and stays exhausted; an empty column family yields nothing.
     #[test]
     fn iterator_scans_in_key_order() {
-        use storage::{OsmIdKey, OsmIdxValue};
+        use node::storage::NodeIdxLocValue;
+        use storage::OsmIdKey;
 
         let dir = tempfile::tempdir().unwrap();
         let (db, _scratch, _db_opts) =
@@ -566,7 +545,10 @@ mod create_db_tests {
         let mut batch = WriteBatchInternal::default();
         batch.insert_cf(NodeIdToIdxTDC::NAME, db.cf_handle(NodeIdToIdxTDC::NAME).unwrap());
         for id in [30, 10, 20] {
-            batch.put::<NodeIdToIdxTDC>(OsmIdKey::new(id), OsmIdxValue::new(id as u64 * 2));
+            batch.put::<NodeIdToIdxTDC>(
+                OsmIdKey::new(id),
+                NodeIdxLocValue::new(id as u64 * 2, 0, 0),
+            );
         }
         write_batch_no_wal(&db, batch.inner()).unwrap();
         finalize_bulk_cfs(&db, &[NodeIdToIdxTDC::NAME]).unwrap();

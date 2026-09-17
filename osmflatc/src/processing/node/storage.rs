@@ -1,5 +1,4 @@
 use crate::processing::storage::OsmIdKey;
-use crate::processing::storage::OsmIdxValue;
 use crate::processing::storage::OsmKey;
 use crate::processing::TempDataCodec;
 use crate::processing::Value;
@@ -56,41 +55,38 @@ impl TempDataCodec for NodesTDC {
     const NAME: &'static str = "NODES";
 }
 
+/// A node's final archive index together with its (scaled) location. Stored
+/// by node id so the way and relation passes resolve both from one sorted
+/// scan or point lookup.
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub struct NodeLonLatValue {
+pub struct NodeIdxLocValue {
+    pub idx: u64,
     pub lon: i32,
     pub lat: i32,
 }
 
-impl NodeLonLatValue {
-    pub fn new(lon: i32, lat: i32) -> Self {
-        NodeLonLatValue { lon, lat }
+impl NodeIdxLocValue {
+    pub fn new(idx: u64, lon: i32, lat: i32) -> Self {
+        Self { idx, lon, lat }
     }
 }
 
-impl Value for NodeLonLatValue {
+impl Value for NodeIdxLocValue {
     fn serialize_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.lon.to_be_bytes());
-        out.extend_from_slice(&self.lat.to_be_bytes());
+        out.extend(self.idx.to_be_bytes());
+        out.extend(self.lon.to_be_bytes());
+        out.extend(self.lat.to_be_bytes());
     }
 }
 
-impl From<&[u8]> for NodeLonLatValue {
-    fn from(value: &[u8]) -> Self {
-        let lon = i32::from_be_bytes(value[0..4].try_into().unwrap());
-        let lat = i32::from_be_bytes(value[4..8].try_into().unwrap());
-        NodeLonLatValue::new(lon, lat)
+impl From<&[u8]> for NodeIdxLocValue {
+    fn from(bytes: &[u8]) -> Self {
+        Self {
+            idx: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+            lon: i32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+            lat: i32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+        }
     }
-}
-
-pub struct NodeIdToLonLatTDC;
-
-impl TempDataCodec for NodeIdToLonLatTDC {
-    type Key = OsmIdKey;
-
-    type Value = NodeLonLatValue;
-
-    const NAME: &'static str = "NODE_ID_TO_LON_LAT";
 }
 
 pub struct NodeIdToIdxTDC;
@@ -98,15 +94,21 @@ pub struct NodeIdToIdxTDC;
 impl TempDataCodec for NodeIdToIdxTDC {
     type Key = OsmIdKey;
 
-    type Value = OsmIdxValue;
+    type Value = NodeIdxLocValue;
 
     const NAME: &'static str = "NODE_ID_TO_IDX";
 }
 
 #[cfg(test)]
 mod tests {
-    use super::NodeValue;
+    use super::{NodeIdxLocValue, NodeValue};
     use crate::processing::Value;
+
+    #[test]
+    fn node_idx_loc_value_roundtrips() {
+        let v = NodeIdxLocValue::new(u64::MAX - 1, -180_000_000, 90_000_000);
+        assert_eq!(NodeIdxLocValue::from(v.serialize().as_slice()), v);
+    }
 
     #[test]
     fn node_value_roundtrips_with_coords_and_tags() {

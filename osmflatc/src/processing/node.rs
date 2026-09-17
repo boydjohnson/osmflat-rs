@@ -1,7 +1,5 @@
 use crate::error::OsmFlatcError;
-use crate::flat_nodes::FlatNodes;
 use crate::processing::storage::OsmIdKey;
-use crate::processing::storage::OsmIdxValue;
 use crate::processing::storage::OsmKey;
 use crate::processing::{
     finalize_bulk_cfs, write_batch_no_wal, RocksDB, RocksDBUnsync, TempDataCodec,
@@ -18,7 +16,7 @@ use log::info;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use rocksdb::DB;
-use storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodeLonLatValue, NodeValue, NodesTDC};
+use storage::{NodeIdToIdxTDC, NodeIdxLocValue, NodeValue, NodesTDC};
 
 pub(crate) mod storage;
 
@@ -30,7 +28,6 @@ pub fn serialize_dense_nodes_primative_block(
     block: &osmpbf::PrimitiveBlock,
     granularity: i32,
     batch: &mut impl RocksDBUnsync,
-    flat_nodes: Option<&FlatNodes>,
     string_table: &Mutex<StringTable>,
     coord_scale: i32,
 ) -> Result<Stats, OsmFlatcError> {
@@ -95,14 +92,6 @@ pub fn serialize_dense_nodes_primative_block(
             let value = NodeValue::new(lon_, lat_, key_refs);
 
             batch.put::<NodesTDC>(key, value);
-
-            if let Some(flat) = flat_nodes {
-                flat.put(id, lon_, lat_)?;
-            } else {
-                let key2 = OsmIdKey::new(id);
-                let value2 = NodeLonLatValue::new(lon_, lat_);
-                batch.put::<NodeIdToLonLatTDC>(key2, value2);
-            }
         }
         assert_eq!(tags_offset, dense_nodes.keys_vals.len());
         stats.num_nodes += dense_nodes.id.len();
@@ -118,7 +107,6 @@ pub fn serialize_dense_node_blocks(
     mut node_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     node_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     db: &DB,
-    flat_nodes: Option<&FlatNodes>,
     blocks: Vec<BlockIndex>,
     data: &[u8],
     tags: &mut TagSerializer,
@@ -144,18 +132,12 @@ pub fn serialize_dense_node_blocks(
             .map(|idx| -> Result<Stats, OsmFlatcError> {
                 let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
                 let mut batch = WriteBatchInternal::default();
-
-                for cf in [NodesTDC::NAME, NodeIdToLonLatTDC::NAME] {
-                    if let Some(cf_handle) = db.cf_handle(cf) {
-                        batch.insert_cf(cf, cf_handle);
-                    }
-                }
+                batch.insert_cf(NodesTDC::NAME, db.cf_handle(NodesTDC::NAME).unwrap());
 
                 let block_stats = serialize_dense_nodes_primative_block(
                     &block,
                     granularity,
                     &mut batch,
-                    flat_nodes,
                     &string_table,
                     coord_scale,
                 )?;
@@ -172,16 +154,9 @@ pub fn serialize_dense_node_blocks(
     *stringtable = string_table.into_inner();
     pb.finish();
 
-    // Write->read boundary: the spatial-order scan below reads `NodesTDC`, and
-    // the way/relation passes point-look-up `NodeIdToLonLat` -- unless the
-    // locations went to the flat-nodes file, in which case that family is
-    // empty and needs no barrier.
-    info!("Compacting node column families...");
-    if flat_nodes.is_some() {
-        finalize_bulk_cfs(db, &[NodesTDC::NAME])?;
-    } else {
-        finalize_bulk_cfs(db, &[NodesTDC::NAME, NodeIdToLonLatTDC::NAME])?;
-    }
+    // Write->read boundary: the spatial-order scan below reads `NodesTDC`.
+    info!("Compacting node column family...");
+    finalize_bulk_cfs(db, &[NodesTDC::NAME])?;
 
     let pb = Progress::new(
         stats.num_nodes as u64,
@@ -220,9 +195,10 @@ pub fn serialize_dense_node_blocks(
                 ids.grow()?.set_value(k.id as u64);
             }
 
-            let node_idx = OsmIdxValue::new(idx);
-
-            batch.put::<NodeIdToIdxTDC>(node_id, node_idx);
+            // The location rides along with the index: the way pass resolves
+            // both for every way ref from one sorted scan of this family, and
+            // the relation pass point-looks-up node member locations here.
+            batch.put::<NodeIdToIdxTDC>(node_id, NodeIdxLocValue::new(idx, v.lon, v.lat));
             pb.inc(1);
 
             if i % BATCH_SIZE == 0 {
@@ -292,7 +268,6 @@ mod tests {
             &block,
             100,
             &mut batch,
-            None,
             &stringtable,
             1_000_000,
         );
@@ -356,7 +331,6 @@ mod tests {
             &block,
             100,
             &mut batch,
-            None,
             &stringtable,
             1_000_000,
         )

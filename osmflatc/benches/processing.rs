@@ -76,7 +76,6 @@ fn bench_serialize_dense_nodes(c: &mut Criterion) {
                     black_box(block),
                     100,
                     &mut batch,
-                    None,
                     &string_table,
                     1_000_000,
                 )
