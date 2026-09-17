@@ -4,8 +4,8 @@ use std::path::Path;
 
 use node::storage::{NodeIdToIdxTDC, NodesTDC};
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions,
-    DBRawIterator, Env, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, DBRawIterator,
+    Env, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
 use way::storage::{
@@ -543,7 +543,10 @@ mod create_db_tests {
             .is_none());
 
         let mut batch = WriteBatchInternal::default();
-        batch.insert_cf(NodeIdToIdxTDC::NAME, db.cf_handle(NodeIdToIdxTDC::NAME).unwrap());
+        batch.insert_cf(
+            NodeIdToIdxTDC::NAME,
+            db.cf_handle(NodeIdToIdxTDC::NAME).unwrap(),
+        );
         for id in [30, 10, 20] {
             batch.put::<NodeIdToIdxTDC>(
                 OsmIdKey::new(id),

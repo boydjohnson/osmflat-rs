@@ -343,8 +343,7 @@ pub fn serialize_relation_blocks(
 ) -> Result<(), Error> {
     // We need to build the index of relation ids first, since relations can refer
     // again to relations.
-    let (found, unresolved) =
-        build_relations_index(data, blocks.clone().into_iter(), db)?;
+    let (found, unresolved) = build_relations_index(data, blocks.clone().into_iter(), db)?;
     let found = {
         let _t = PhaseTimer::start("relations_resolve_nested");
         resolve_all_relations(found, unresolved)

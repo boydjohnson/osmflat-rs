@@ -264,13 +264,8 @@ mod tests {
 
         let stringtable = Mutex::new(StringTable::default());
 
-        let stats = serialize_dense_nodes_primative_block(
-            &block,
-            100,
-            &mut batch,
-            &stringtable,
-            1_000_000,
-        );
+        let stats =
+            serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000);
 
         assert!(stats.is_ok());
 
@@ -327,14 +322,9 @@ mod tests {
         let mut batch = MockRocksBatch::default();
         let stringtable = Mutex::new(StringTable::default());
 
-        let stats = serialize_dense_nodes_primative_block(
-            &block,
-            100,
-            &mut batch,
-            &stringtable,
-            1_000_000,
-        )
-        .unwrap();
+        let stats =
+            serialize_dense_nodes_primative_block(&block, 100, &mut batch, &stringtable, 1_000_000)
+                .unwrap();
 
         assert_eq!(stats.num_nodes, 3);
 
