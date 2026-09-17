@@ -4,35 +4,36 @@ use crate::{
     add_string_table,
     osmpbf::{self, read_block, BlockIndex},
     processing::{
-        node::storage::NodeIdToIdxTDC,
-        storage::{EmptyValue, OrdinalKey, OsmIdKey, OsmIdxValue, OsmKey, RefKey},
-        NodeLocations, RocksDB, RocksDBUnsync, TempDataCodec,
+        key_ranges,
+        node::storage::{NodeIdToIdxTDC, NodeIdxLocValue},
+        range_iterator,
+        storage::{EmptyValue, OsmIdKey, OsmIdxValue, OsmKey},
+        KeyRange, RocksDB, RocksDBUnsync, TempDataCodec,
     },
     stats::{MissingRefs, Stats},
     strings::StringTable,
     Error, PhaseTimer, Progress, TagSerializer, BATCH_SIZE,
 };
-use geo::{BoundingRect, MultiPoint};
 use log::info;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use rocksdb::{statistics::Ticker, Options, DB};
+use rocksdb::DB;
+use space_time::xzorder::xz2_sfc::XZ2SFC;
 use storage::{
-    ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayMbbValue, WayRefByNodeTDC, WayTDC, WayValue,
+    ResolvedNodeValue, ResolvedWayValue, WayByIdTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayMbbValue,
+    WayNodeRefKey, WayNodeRefTDC, WayNodeResolvedTDC, WayPosKey, WayTDC, WayValue,
 };
 
 pub(crate) mod storage;
 
+/// Stage a way for the node join: the way itself keyed by id, plus one
+/// node-id-keyed index entry per node ref. No node lookups happen here.
 fn serialize_ways(
     block: &osmpbf::PrimitiveBlock,
     batch: &mut impl RocksDBUnsync,
-    node_locations: &NodeLocations,
     stringtable: &Mutex<StringTable>,
-    coord_scale: i32,
 ) -> Result<Stats, OsmFlatcError> {
     let mut stats = Stats::default();
-
-    let curve = osmflat::way_curve();
 
     // Shared across the worker threads; hold the lock only for the per-block
     // string interning, not the per-way serialization below.
@@ -45,59 +46,28 @@ fn serialize_ways(
         for pbf_way in &group.ways {
             debug_assert_eq!(pbf_way.keys.len(), pbf_way.vals.len(), "invalid input data");
 
-            let mut key_vals = vec![];
+            let key_vals = pbf_way
+                .keys
+                .iter()
+                .zip(&pbf_way.vals)
+                .map(|(&k, &v)| (string_refs[k as usize], string_refs[v as usize]))
+                .collect();
 
-            for i in 0..pbf_way.keys.len() {
-                key_vals.push((
-                    string_refs[pbf_way.keys[i] as usize],
-                    string_refs[pbf_way.vals[i] as usize],
-                ));
-            }
-
-            let mut locations = vec![];
-            let mut node_refs = vec![];
+            let mut node_refs = Vec::with_capacity(pbf_way.refs.len());
             let mut ref_id = 0;
-            for r in &pbf_way.refs {
+            for (pos, r) in pbf_way.refs.iter().enumerate() {
                 ref_id += r;
-
                 node_refs.push(ref_id);
-
-                if let Some((lon, lat)) = node_locations.get(ref_id)? {
-                    locations.push((
-                        lon as f64 / coord_scale as f64,
-                        lat as f64 / coord_scale as f64,
-                    ));
-                }
-            }
-
-            let points: MultiPoint<_> = locations.into();
-
-            let mbr = points.bounding_rect();
-            if let Some(br) = mbr {
-                let min_x = br.min().x;
-                let min_y = br.min().y;
-                let max_x = br.max().x;
-                let max_y = br.max().y;
-
-                let spatial_index = osmflat::bbox_index(&curve, min_x, min_y, max_x, max_y);
-
-                let key = OsmKey::new(spatial_index, pbf_way.id);
-                let value = WayValue::new(node_refs, key_vals);
-
-                batch.put::<WayTDC>(key, value);
-
-                let id_key = OsmIdKey::new(pbf_way.id);
-
-                batch.put::<WayIdToMbbTDC>(
-                    id_key,
-                    WayMbbValue::new(
-                        [min_x, min_y, max_x, max_y]
-                            .into_iter()
-                            .map(|v| (v * coord_scale as f64) as i32)
-                            .collect(),
-                    ),
+                batch.put::<WayNodeRefTDC>(
+                    WayNodeRefKey::new(ref_id, pbf_way.id, pos as u32),
+                    EmptyValue,
                 );
             }
+
+            batch.put::<WayByIdTDC>(
+                OsmIdKey::new(pbf_way.id),
+                WayValue::new(node_refs, key_vals),
+            );
         }
         stats.num_ways += group.ways.len();
     }
@@ -105,12 +75,216 @@ fn serialize_ways(
     Ok(stats)
 }
 
+/// Resolve a way's nodes into its bounding box (in degrees), its spatial key,
+/// and the value written to `WayTDC`. `resolved` holds the join output for
+/// this way, in position order; refs with no row resolved to nothing.
+/// Returns `None` for a way with no locatable node, which is dropped.
+fn resolve_way(
+    curve: &XZ2SFC,
+    way_id: i64,
+    way: WayValue,
+    resolved: &[(u32, ResolvedNodeValue)],
+    coord_scale: i32,
+) -> Option<(OsmKey, ResolvedWayValue, WayMbbValue)> {
+    let scale = coord_scale as f64;
+    let mut node_idxs = vec![None; way.node_refs.len()];
+    let mut bbox: Option<(f64, f64, f64, f64)> = None;
+    for &(pos, node) in resolved {
+        if let Some(slot) = node_idxs.get_mut(pos as usize) {
+            *slot = Some(node.idx);
+        }
+        let (x, y) = (node.lon as f64 / scale, node.lat as f64 / scale);
+        bbox = Some(match bbox {
+            None => (x, y, x, y),
+            Some((min_x, min_y, max_x, max_y)) => {
+                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+            }
+        });
+    }
+    let (min_x, min_y, max_x, max_y) = bbox?;
+
+    let missing_node_ids = way
+        .node_refs
+        .iter()
+        .zip(&node_idxs)
+        .filter(|(_, idx)| idx.is_none())
+        .map(|(&n, _)| n)
+        .collect();
+
+    let spatial_index = osmflat::bbox_index(curve, min_x, min_y, max_x, max_y);
+    let mbb = [min_x, min_y, max_x, max_y]
+        .into_iter()
+        .map(|v| (v * scale) as i32)
+        .collect();
+
+    Some((
+        OsmKey::new(spatial_index, way_id),
+        ResolvedWayValue::new(node_idxs, missing_node_ids, way.key_vals),
+        WayMbbValue::new(mbb),
+    ))
+}
+
+/// Advance a forward-only node-id-keyed scan until `cur` is the first entry
+/// with id >= `id`. Callers must ask for non-decreasing ids.
+fn seek_forward<V>(
+    iter: &mut impl Iterator<Item = Result<(OsmIdKey, V), OsmFlatcError>>,
+    cur: &mut Option<(OsmIdKey, V)>,
+    id: i64,
+) -> Result<(), OsmFlatcError> {
+    while matches!(cur, Some((key, _)) if key.id < id) {
+        *cur = iter.next().transpose()?;
+    }
+    Ok(())
+}
+
+/// Number of key ranges a parallel scan is split into: several per worker,
+/// so an unevenly dense range does not leave the other workers idle.
+fn parallel_scan_ranges() -> usize {
+    rayon::current_num_threads() * 4
+}
+
+/// Phase 1 of the way pass (see `serialize_way_blocks`): merge-join the
+/// node-id-sorted ref index against `NodeIdToIdx` (index and location per
+/// node), writing each resolved ref keyed by (way id, position).
+///
+/// Every input is sorted by node id, so the node-id space is split into
+/// ranges joined independently in parallel; a node id's refs and its node
+/// entries always fall in the same range. Output order does not matter, since
+/// the output family is compacted before it is read. Kept out of line so
+/// profiles attribute it separately.
+#[inline(never)]
+fn join_way_node_refs(db: &DB) -> Result<(), OsmFlatcError> {
+    let _t = PhaseTimer::start("ways_join_nodes");
+    let ranges = key_ranges(db, WayNodeRefTDC::NAME, 8, parallel_scan_ranges())?;
+    let (refs_seen, resolved_count) = ranges
+        .par_iter()
+        .map(|range| join_way_node_refs_range(db, range))
+        .try_reduce(|| (0, 0), |a, b| Ok((a.0 + b.0, a.1 + b.1)))?;
+    log::debug!(
+        "[ways_join_nodes] ranges={} refs={refs_seen} resolved={resolved_count}",
+        ranges.len()
+    );
+    Ok(())
+}
+
+/// Join the refs whose node id falls in `range`; returns (refs, resolved).
+fn join_way_node_refs_range(db: &DB, range: &KeyRange) -> Result<(u64, u64), OsmFlatcError> {
+    let mut node_iter = range_iterator::<NodeIdToIdxTDC>(db, range);
+    let mut node_cur: Option<(OsmIdKey, NodeIdxLocValue)> = node_iter.next().transpose()?;
+
+    let resolved_cf = db.cf_handle(WayNodeResolvedTDC::NAME).unwrap();
+    let mut batch = WriteBatchInternal::default();
+    batch.insert_cf(WayNodeResolvedTDC::NAME, resolved_cf);
+    let mut refs_seen: u64 = 0;
+    let mut resolved_count: u64 = 0;
+    for r in range_iterator::<WayNodeRefTDC>(db, range) {
+        let (ref_key, _) = r?;
+        let node_id = ref_key.node_id;
+
+        seek_forward(&mut node_iter, &mut node_cur, node_id)?;
+        // A node absent from the archive gets no row: the ref is simply
+        // unresolved when its way is assembled.
+        if let Some((key, node)) = &node_cur {
+            if key.id == node_id {
+                batch.put::<WayNodeResolvedTDC>(
+                    WayPosKey::new(ref_key.way_id, ref_key.pos),
+                    ResolvedNodeValue::new(node.idx, node.lon, node.lat),
+                );
+                resolved_count += 1;
+            }
+        }
+        refs_seen += 1;
+        if refs_seen.is_multiple_of(BATCH_SIZE as u64) {
+            write_batch_no_wal(db, batch.inner())?;
+            batch = WriteBatchInternal::default();
+            batch.insert_cf(WayNodeResolvedTDC::NAME, resolved_cf);
+        }
+    }
+    write_batch_no_wal(db, batch.inner())?;
+    Ok((refs_seen, resolved_count))
+}
+
+/// Phase 2 of the way pass (see `serialize_way_blocks`): merge staged ways
+/// with their resolved refs, compute spatial keys, and write `WayTDC` and
+/// `WayIdToMbbTDC`.
+///
+/// Both inputs are sorted by way id, so the way-id space is split into ranges
+/// processed independently in parallel, like the join. Kept out of line so
+/// profiles attribute it separately.
+#[inline(never)]
+fn compute_way_bboxes(db: &DB, num_ways: usize, coord_scale: i32) -> Result<(), OsmFlatcError> {
+    let _t = PhaseTimer::start("ways_bbox");
+    let pb = Progress::new(num_ways as u64, "Computing way bounding boxes");
+    let ranges = key_ranges(db, WayNodeResolvedTDC::NAME, 8, parallel_scan_ranges())?;
+    ranges
+        .par_iter()
+        .try_for_each(|range| compute_way_bboxes_range(db, range, coord_scale, &pb))?;
+    pb.finish();
+    Ok(())
+}
+
+/// Compute bounding boxes for the ways whose id falls in `range`.
+fn compute_way_bboxes_range(
+    db: &DB,
+    range: &KeyRange,
+    coord_scale: i32,
+    pb: &Progress,
+) -> Result<(), OsmFlatcError> {
+    let curve = osmflat::way_curve();
+
+    let way_cf = db.cf_handle(WayTDC::NAME).unwrap();
+    let mbb_cf = db.cf_handle(WayIdToMbbTDC::NAME).unwrap();
+    let new_batch = || {
+        let mut batch = WriteBatchInternal::default();
+        batch.insert_cf(WayTDC::NAME, way_cf);
+        batch.insert_cf(WayIdToMbbTDC::NAME, mbb_cf);
+        batch
+    };
+    let mut batch = new_batch();
+
+    let mut resolved_iter = range_iterator::<WayNodeResolvedTDC>(db, range);
+    let mut resolved_cur: Option<(WayPosKey, ResolvedNodeValue)> =
+        resolved_iter.next().transpose()?;
+    let mut resolved = Vec::new();
+    let mut ways_seen: usize = 0;
+    for r in range_iterator::<WayByIdTDC>(db, range) {
+        let (way_key, way) = r?;
+        let way_id = way_key.id;
+
+        resolved.clear();
+        while let Some((key, val)) = &resolved_cur {
+            if key.way_id > way_id {
+                break;
+            }
+            if key.way_id == way_id {
+                resolved.push((key.pos, *val));
+            }
+            resolved_cur = resolved_iter.next().transpose()?;
+        }
+
+        if let Some((key, value, mbb)) = resolve_way(&curve, way_id, way, &resolved, coord_scale) {
+            batch.put::<WayTDC>(key, value);
+            batch.put::<WayIdToMbbTDC>(way_key, mbb);
+        }
+
+        ways_seen += 1;
+        if ways_seen.is_multiple_of(BATCH_SIZE) {
+            write_batch_no_wal(db, batch.inner())?;
+            batch = new_batch();
+            // Per batch, not per way: `inc` can take a lock, and this runs
+            // on every worker.
+            pb.inc(BATCH_SIZE as u64);
+        }
+    }
+    write_batch_no_wal(db, batch.inner())?;
+    pb.inc((ways_seen % BATCH_SIZE) as u64);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn serialize_way_blocks(
     builder: &osmflat::OsmBuilder,
     db: &DB,
-    db_opts: &Options,
-    node_locations: &NodeLocations,
     mut way_ids: Option<flatdata::ExternalVector<osmflat::Id>>,
     way_by_id: Option<flatdata::ExternalVector<osmflat::IdxRef>>,
     blocks: Vec<BlockIndex>,
@@ -125,13 +299,25 @@ pub fn serialize_way_blocks(
     let pb = Progress::new(blocks.len() as u64, "Converting ways");
     let mut nodes_index = builder.start_nodes_index()?;
 
-    // The per-member RocksDB node-location lookups dominate this pass, so fan it
-    // out across all Rayon workers rather than running on a single consumer. The
-    // string table is shared behind a Mutex (locked once per block) and the
-    // per-block `stats` are commutative, merged with `try_reduce`. Order is
-    // irrelevant: ways are emitted later by iterating RocksDB in sorted key
-    // order. `std::mem::take` moves the caller's table in for the duration and
-    // it is restored below.
+    // A way needs its nodes twice: their locations, for the bounding box that
+    // determines its spatial key, and their final archive indices, for
+    // `nodes_index`. `NodeIdToIdx` carries both, keyed by node id, so one
+    // sort-merge join resolves every ref with sequential I/O only, instead of
+    // a random lookup per ref:
+    //   0. (parallel, per block) stage each way keyed by id, and index every
+    //      node ref by (node id, way id, position).
+    //   1. merge-join that index against `NodeIdToIdx`, writing each resolved
+    //      ref keyed by (way id, position).
+    //   2. merge the staged ways with the resolved refs (both way-id sorted),
+    //      compute each way's bounding box and spatial key, and write it with
+    //      its node indices inlined.
+    //   3. scan the ways in spatial order and write the archive.
+
+    // Phase 0. Order is irrelevant: everything downstream reads sorted scans.
+    // The string table is shared behind a Mutex (locked once per block) and
+    // the per-block `stats` are commutative, merged with `try_reduce`.
+    // `std::mem::take` moves the caller's table in for the duration and it is
+    // restored below.
     let string_table = Mutex::new(std::mem::take(stringtable));
     let total = {
         let _t = PhaseTimer::start("ways_convert");
@@ -141,18 +327,12 @@ pub fn serialize_way_blocks(
                 let block: osmpbf::PrimitiveBlock = read_block(data, &idx)?;
 
                 let mut batch = WriteBatchInternal::default();
-                for cf_name in [WayTDC::NAME, WayIdToMbbTDC::NAME] {
+                for cf_name in [WayByIdTDC::NAME, WayNodeRefTDC::NAME] {
                     let cf = db.cf_handle(cf_name).unwrap();
                     batch.insert_cf(cf_name, cf);
                 }
 
-                let block_stats = serialize_ways(
-                    &block,
-                    &mut batch,
-                    node_locations,
-                    &string_table,
-                    coord_scale,
-                )?;
+                let block_stats = serialize_ways(&block, &mut batch, &string_table)?;
 
                 write_batch_no_wal(db, batch.inner())?;
 
@@ -171,11 +351,21 @@ pub fn serialize_way_blocks(
     pb.finish();
     info!("Ways converted.");
 
+    info!("Compacting staged ways and node-ref index...");
+    finalize_bulk_cfs(db, &[WayByIdTDC::NAME, WayNodeRefTDC::NAME])?;
+
+    join_way_node_refs(db)?;
+    info!("Compacting resolved way node refs...");
+    finalize_bulk_cfs(db, &[WayNodeResolvedTDC::NAME])?;
+
+    compute_way_bboxes(db, stats.num_ways, coord_scale)?;
+
     // Write->read boundary: the spatial-order scan below reads `WayTDC`, and
     // the relation pass point-looks-up `WayIdToMbb`.
     info!("Compacting way column families...");
     finalize_bulk_cfs(db, &[WayTDC::NAME, WayIdToMbbTDC::NAME])?;
 
+    // Phase 3.
     let mut batch = WriteBatchInternal::default();
     let cf = db.cf_handle(WayIdToIdxTDC::NAME).unwrap();
     batch.insert_cf(WayIdToIdxTDC::NAME, cf);
@@ -185,121 +375,7 @@ pub fn serialize_way_blocks(
         "Ordering ways by spatial index order",
     );
 
-    // Resolving each way's node refs to their final archive indices used to be
-    // one random RocksDB point lookup (or batched multi_get) per way against
-    // `NodeIdToIdx` -- cheap per call, but measured (2026-07-11 bench) at ~70%
-    // block-cache hit rate with tens of thousands of genuine cache misses per
-    // 100k ways, each costing real disk-seek latency (~0.5-0.7ms/miss), which
-    // dominates this pass's wall clock almost entirely (sequential write cost
-    // is negligible by comparison). A sort-merge join fixes that structurally
-    // instead of trying to make the random access cheaper: build an index of
-    // every way-ref keyed by its *referenced node id* (`WayRefByNodeTDC`),
-    // then merge-join two sorted, sequential scans -- that index and
-    // `NodeIdToIdx` itself -- to resolve every ref with zero random reads.
-    // Three passes total, all sequential:
-    //   0. scan `WayTDC` once, assign each ref an `ordinal` (its position in the
-    //      `nodes_index` array being built) and index it by node id.
-    //   1. merge-join the node-id-sorted index against `NodeIdToIdx` -- resolved
-    //      indices land in `ResolvedRefTDC`, keyed by `ordinal`.
-    //   2. scan `WayTDC` again (same order, so ordinals realign) and merge in
-    //      `ResolvedRefTDC` (sorted by ordinal) to do the actual writes.
-
-    // Phase 0: index every way-ref by its referenced node id.
-    let t_build = std::time::Instant::now();
-    {
-        let mut ref_batch = WriteBatchInternal::default();
-        let ref_cf = db.cf_handle(WayRefByNodeTDC::NAME).unwrap();
-        ref_batch.insert_cf(WayRefByNodeTDC::NAME, ref_cf);
-        let mut ordinal: u64 = 0;
-        for r in <DB as RocksDB>::iterator::<WayTDC>(db)? {
-            let (_way_id, v) = r?;
-            for &n in &v.node_refs {
-                ref_batch.put::<WayRefByNodeTDC>(RefKey::new(n, ordinal), EmptyValue);
-                ordinal += 1;
-                if ordinal.is_multiple_of(BATCH_SIZE as u64) {
-                    write_batch_no_wal(db, ref_batch.inner())?;
-                    ref_batch = WriteBatchInternal::default();
-                    let ref_cf = db.cf_handle(WayRefByNodeTDC::NAME).unwrap();
-                    ref_batch.insert_cf(WayRefByNodeTDC::NAME, ref_cf);
-                }
-            }
-        }
-        write_batch_no_wal(db, ref_batch.inner())?;
-        log::debug!(
-            "[timing] phase=\"ways_ordering_build_refs\" secs={:.3} total_refs={ordinal}",
-            t_build.elapsed().as_secs_f64()
-        );
-    }
-    info!("Compacting way node-ref index...");
-    finalize_bulk_cfs(db, &[WayRefByNodeTDC::NAME])?;
-
-    // Phase 1: merge-join the node-id-sorted ref index against `NodeIdToIdx`.
-    // Both iterators only ever move forward -- `node_cur` is advanced up to
-    // (never past) each ref's node id, so the whole pass is O(refs + nodes)
-    // sequential I/O instead of O(refs) random point lookups.
-    let t_join = std::time::Instant::now();
-    let cache_hit_before = db_opts.get_ticker_count(Ticker::BlockCacheDataHit);
-    let cache_miss_before = db_opts.get_ticker_count(Ticker::BlockCacheDataMiss);
-    {
-        let mut node_iter = <DB as RocksDB>::iterator::<NodeIdToIdxTDC>(db)?;
-        let mut node_cur: Option<(OsmIdKey, OsmIdxValue)> = node_iter.next().transpose()?;
-        let mut resolved_batch = WriteBatchInternal::default();
-        let resolved_cf = db.cf_handle(ResolvedRefTDC::NAME).unwrap();
-        resolved_batch.insert_cf(ResolvedRefTDC::NAME, resolved_cf);
-        let mut refs_seen: u64 = 0;
-        let mut resolved_count: u64 = 0;
-        for r in <DB as RocksDB>::iterator::<WayRefByNodeTDC>(db)? {
-            let (ref_key, _) = r?;
-            while let Some((node_key, _)) = &node_cur {
-                if node_key.id < ref_key.target_id {
-                    node_cur = node_iter.next().transpose()?;
-                } else {
-                    break;
-                }
-            }
-            if let Some((node_key, node_val)) = &node_cur {
-                if node_key.id == ref_key.target_id {
-                    resolved_batch.put::<ResolvedRefTDC>(
-                        OrdinalKey::new(ref_key.ordinal),
-                        OsmIdxValue::new(node_val.idx),
-                    );
-                    resolved_count += 1;
-                }
-                // else `node_key.id > ref_key.target_id`: this ref's node is
-                // absent from the archive -- leave it unresolved, same as the
-                // old `multi_get` code's `None` for a missing key.
-            }
-            refs_seen += 1;
-            if refs_seen.is_multiple_of(BATCH_SIZE as u64) {
-                write_batch_no_wal(db, resolved_batch.inner())?;
-                resolved_batch = WriteBatchInternal::default();
-                let resolved_cf = db.cf_handle(ResolvedRefTDC::NAME).unwrap();
-                resolved_batch.insert_cf(ResolvedRefTDC::NAME, resolved_cf);
-            }
-        }
-        write_batch_no_wal(db, resolved_batch.inner())?;
-        log::debug!(
-            "[timing] phase=\"ways_ordering_merge_join\" secs={:.3} refs={refs_seen} resolved={resolved_count}",
-            t_join.elapsed().as_secs_f64()
-        );
-    }
-    let cache_hit_after = db_opts.get_ticker_count(Ticker::BlockCacheDataHit);
-    let cache_miss_after = db_opts.get_ticker_count(Ticker::BlockCacheDataMiss);
-    log::debug!(
-        "[timing] phase=\"ways_ordering_merge_join_cache\" secs=0.000 block_cache_data_hit={} block_cache_data_miss={}",
-        cache_hit_after - cache_hit_before,
-        cache_miss_after - cache_miss_before
-    );
-    info!("Compacting way ref resolution index...");
-    finalize_bulk_cfs(db, &[ResolvedRefTDC::NAME])?;
-
-    // Phase 2: re-scan `WayTDC` (ordinals realign with phase 0's since both
-    // scans see the same immutable, already-compacted CF in the same order)
-    // and merge in `ResolvedRefTDC` -- another forward-only, sequential merge.
     let t_write = std::time::Instant::now();
-    let mut resolved_iter = <DB as RocksDB>::iterator::<ResolvedRefTDC>(db)?;
-    let mut resolved_cur: Option<(OrdinalKey, OsmIdxValue)> = resolved_iter.next().transpose()?;
-    let mut ordinal: u64 = 0;
     for (way_idx, r) in <DB as RocksDB>::iterator::<WayTDC>(db)?.enumerate() {
         let (way_key, v) = r?;
         let way_id = way_key.id;
@@ -315,25 +391,11 @@ pub fn serialize_way_blocks(
 
         batch.put::<WayIdToIdxTDC>(OsmIdKey::new(way_id), OsmIdxValue::new(way_idx as u64));
 
-        for &n in &v.node_refs {
-            while let Some((key, _)) = &resolved_cur {
-                if key.ordinal < ordinal {
-                    resolved_cur = resolved_iter.next().transpose()?;
-                } else {
-                    break;
-                }
-            }
-            let resolved_idx = match &resolved_cur {
-                Some((key, val)) if key.ordinal == ordinal => Some(val.idx),
-                _ => None,
-            };
-            if resolved_idx.is_none() {
-                // A node referenced by a way but absent from the archive.
-                missing.nodes_in_ways.insert(n);
-            }
-            nodes_index.grow()?.set_value(resolved_idx);
-            ordinal += 1;
+        for &idx in &v.node_idxs {
+            nodes_index.grow()?.set_value(idx);
         }
+        // Nodes referenced by a way but absent from the archive.
+        missing.nodes_in_ways.extend(v.missing_node_ids);
 
         if let Some(ids) = &mut way_ids {
             ids.grow()?.set_value(way_id as u64);
@@ -374,9 +436,10 @@ pub fn serialize_way_blocks(
     nodes_index.close()?;
 
     // Reverse index: `WayIdToIdx` is keyed by OSM id (big-endian), so iterating
-    // it yields `(id, final_idx)` in ascending-id order. Emitting just the index
-    // gives a permutation `p` with `ids.ways[p[k]]` ascending by id, which the
-    // query side binary-searches. See the node path for the rationale.
+    // it yields `(id, final_idx)` in ascending-id order. Emitting just the
+    // index gives a permutation `p` with `ids.ways[p[k]]` ascending by id,
+    // which the query side binary-searches. See the node path for the
+    // rationale.
     if let Some(mut by_id) = way_by_id {
         for r in <DB as RocksDB>::iterator::<WayIdToIdxTDC>(db)? {
             let (_id, idx) = r?;

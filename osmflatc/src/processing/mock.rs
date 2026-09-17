@@ -41,10 +41,7 @@ impl RocksDB for MockRocksBatch {
                 fam.iter()
                     .sorted_unstable_by_key(|(k, _)| k.to_vec())
                     .map(|(k, v)| {
-                        Ok((
-                            TDC::Key::from(k.clone().into_boxed_slice()),
-                            TDC::Value::from(v.clone().into_boxed_slice()),
-                        ))
+                        Ok((TDC::Key::from(k.as_slice()), TDC::Value::from(v.as_slice())))
                     })
             },
         )))

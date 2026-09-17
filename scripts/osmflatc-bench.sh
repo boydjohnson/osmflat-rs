@@ -13,7 +13,7 @@
 # Example:
 #   scripts/osmflatc-bench.sh --label baseline -- \
 #       us-west-latest.osm.pbf us-west.osm.flat \
-#       --max-open-files 1000 --write-buffer-mb 4000 --block-cache-mb 4000 --flat-nodes
+#       --max-open-files 1000 --write-buffer-mb 4000 --block-cache-mb 4000
 #
 # Compare across runs:
 #   awk -F, '$1=="baseline" || $1=="readahead-4mb"' bench-results/timings.csv \
@@ -42,8 +42,9 @@ LOG="$RESULTS_DIR/${LABEL}-${TS}.log"
 IOSTAT_LOG="$RESULTS_DIR/${LABEL}-${TS}.iostat.log"
 CSV="$RESULTS_DIR/timings.csv"
 
-BIN="$REPO_ROOT/target/release/osmflatc"
-if [[ ! -x "$BIN" ]]; then
+# Override with OSMFLATC_BIN to bench another build, e.g. target/dist/osmflatc.
+BIN="${OSMFLATC_BIN:-$REPO_ROOT/target/release/osmflatc}"
+if [[ -z "${OSMFLATC_BIN:-}" && ! -x "$BIN" ]]; then
     echo "Building release osmflatc..." >&2
     (cd "$REPO_ROOT" && cargo build --release -p osmflatc)
 fi

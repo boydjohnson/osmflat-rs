@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::path::Path;
 
-use node::storage::{NodeIdToIdxTDC, NodeIdToLonLatTDC, NodesTDC};
+use node::storage::{NodeIdToIdxTDC, NodesTDC};
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, Env,
-    IteratorMode, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, DBRawIterator,
+    Env, MemtableFactory, Options, ReadOptions, WriteBatch, WriteOptions, DB,
 };
 use tempfile::TempDir;
-use way::storage::{ResolvedRefTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayRefByNodeTDC, WayTDC};
+use way::storage::{
+    WayByIdTDC, WayIdToIdxTDC, WayIdToMbbTDC, WayNodeRefTDC, WayNodeResolvedTDC, WayTDC,
+};
 
 use crate::error::OsmFlatcError;
 use relation::storage::{
@@ -27,12 +30,26 @@ pub mod way;
 /// read pipeline full, small enough to not matter on an 8GB laptop.
 const READAHEAD_BYTES: usize = 4 * 1024 * 1024;
 
-pub trait Key: From<Box<[u8]>> {
-    fn serialize(&self) -> Vec<u8>;
+pub trait Key: for<'a> From<&'a [u8]> {
+    /// Append the encoded key to `out`.
+    fn serialize_into(&self, out: &mut Vec<u8>);
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out);
+        out
+    }
 }
 
-pub trait Value: From<Box<[u8]>> {
-    fn serialize(&self) -> Vec<u8>;
+pub trait Value: for<'a> From<&'a [u8]> {
+    /// Append the encoded value to `out`.
+    fn serialize_into(&self, out: &mut Vec<u8>);
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out);
+        out
+    }
 }
 
 pub trait TempDataCodec {
@@ -61,6 +78,10 @@ pub trait RocksDBSync {
 pub struct WriteBatchInternal<'a> {
     batch: WriteBatch,
     families: BTreeMap<String, &'a ColumnFamily>,
+    // Reused encode buffers: `WriteBatch` copies each put, so there is no
+    // need for a fresh allocation per key and value.
+    key_buf: Vec<u8>,
+    value_buf: Vec<u8>,
 }
 
 impl<'a> WriteBatchInternal<'a> {
@@ -76,7 +97,11 @@ impl<'a> WriteBatchInternal<'a> {
 impl<'a> RocksDBUnsync for WriteBatchInternal<'a> {
     fn put<TDC: TempDataCodec>(&mut self, key: TDC::Key, value: TDC::Value) {
         let fam = self.families.get(TDC::NAME).unwrap();
-        self.batch.put_cf(fam, key.serialize(), value.serialize());
+        self.key_buf.clear();
+        key.serialize_into(&mut self.key_buf);
+        self.value_buf.clear();
+        value.serialize_into(&mut self.value_buf);
+        self.batch.put_cf(fam, &self.key_buf, &self.value_buf);
     }
 }
 
@@ -99,7 +124,7 @@ impl RocksDBSync for DB {
 
         self.get_cf(cf, key.serialize())
             .map_err(OsmFlatcError::RocksDB)
-            .map(|v| v.map(|b| TDC::Value::from(b.into())))
+            .map(|v| v.map(|b| TDC::Value::from(&b[..])))
     }
 
     fn multi_get<TDC: TempDataCodec>(
@@ -113,7 +138,7 @@ impl RocksDBSync for DB {
             .into_iter()
             .map(|res| {
                 res.map_err(OsmFlatcError::RocksDB)
-                    .map(|opt| opt.map(|slice| TDC::Value::from(Box::<[u8]>::from(slice.as_ref()))))
+                    .map(|opt| opt.map(|slice| TDC::Value::from(slice.as_ref())))
             })
             .collect()
     }
@@ -130,42 +155,141 @@ impl RocksDB for DB {
         <TDC as TempDataCodec>::Key: 'a,
         <TDC as TempDataCodec>::Value: 'a,
     {
-        let cf = self.cf_handle(TDC::NAME).unwrap();
-
-        // This drives the ordering passes' full column-family scans. With the
-        // default `ReadOptions` (readahead disabled) every block is a
-        // synchronous fetch at queue depth 1 -- on fast NVMe that leaves most
-        // of the drive's IOPS/bandwidth unused and the process CPU-idle,
-        // since nothing overlaps the reads. A forward readahead window lets
-        // RocksDB prefetch ahead of the iterator instead.
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_readahead_size(READAHEAD_BYTES);
-
-        let iter = self.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
-        Ok(Box::new(iter.map(|res| {
-            res.map_err(OsmFlatcError::RocksDB)
-                .map(|(k, v)| (TDC::Key::from(k), TDC::Value::from(v)))
-        })))
+        Ok(Box::new(range_iterator::<TDC>(self, &KeyRange::FULL)))
     }
 }
 
-/// Backend for the id -> (lon, lat) node-location lookups performed by the
-/// way and relation passes: the `NodeIdToLonLat` RocksDB column family by
-/// default, or the flat mmap'd file when `--flat-nodes` is active.
-pub enum NodeLocations<'a> {
-    Rocks(&'a DB),
-    Flat(&'a crate::flat_nodes::FlatNodes),
+/// A contiguous span of a column family's key space: `lower` inclusive,
+/// `upper` exclusive, `None` meaning unbounded.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct KeyRange {
+    pub lower: Option<Vec<u8>>,
+    pub upper: Option<Vec<u8>>,
 }
 
-impl NodeLocations<'_> {
-    pub fn get(&self, id: i64) -> Result<Option<(i32, i32)>, OsmFlatcError> {
-        match self {
-            NodeLocations::Rocks(db) => Ok(<DB as RocksDBSync>::get::<NodeIdToLonLatTDC>(
-                db,
-                &storage::OsmIdKey::new(id),
-            )?
-            .map(|v| (v.lon, v.lat))),
-            NodeLocations::Flat(flat) => Ok(flat.get(id)),
+impl KeyRange {
+    pub const FULL: KeyRange = KeyRange {
+        lower: None,
+        upper: None,
+    };
+}
+
+/// Scan the entries of `TDC`'s column family that fall in `range`, in key
+/// order. Bounds are compared bytewise, so a bound may be a key prefix: e.g.
+/// the 8-byte encoding of an id bounds both id-keyed families and families
+/// whose keys start with that id.
+pub(crate) fn range_iterator<'a, TDC: TempDataCodec>(
+    db: &'a DB,
+    range: &KeyRange,
+) -> impl Iterator<Item = Result<(TDC::Key, TDC::Value), OsmFlatcError>> + 'a
+where
+    TDC::Key: 'a,
+    TDC::Value: 'a,
+{
+    let cf = db.cf_handle(TDC::NAME).unwrap();
+
+    // This drives the ordering passes' column-family scans. With the default
+    // `ReadOptions` (readahead disabled) every block is a synchronous fetch
+    // at queue depth 1 -- on fast NVMe that leaves most of the drive's
+    // IOPS/bandwidth unused and the process CPU-idle, since nothing overlaps
+    // the reads. A forward readahead window lets RocksDB prefetch ahead of
+    // the iterator instead.
+    let mut read_opts = ReadOptions::default();
+    read_opts.set_readahead_size(READAHEAD_BYTES);
+    if let Some(lower) = &range.lower {
+        read_opts.set_iterate_lower_bound(lower.clone());
+    }
+    if let Some(upper) = &range.upper {
+        read_opts.set_iterate_upper_bound(upper.clone());
+    }
+
+    let mut raw = db.raw_iterator_cf_opt(cf, read_opts);
+    raw.seek_to_first();
+    DecodingIter::<TDC::Key, TDC::Value> {
+        raw,
+        first: true,
+        _codec: PhantomData,
+    }
+}
+
+/// Split a compacted column family's key space into at most `max_ranges`
+/// contiguous ranges of roughly equal size, for scanning in parallel.
+///
+/// Boundaries come from the start keys of the family's SST files (all
+/// similarly sized after `finalize_bulk_cfs`), truncated to `prefix_len`
+/// bytes so that entries sharing a key prefix -- e.g. all refs to one node
+/// id -- always land in the same range. The ranges tile the whole key space
+/// whatever the file layout, so balance depends on it but correctness does
+/// not.
+pub(crate) fn key_ranges(
+    db: &DB,
+    cf_name: &str,
+    prefix_len: usize,
+    max_ranges: usize,
+) -> Result<Vec<KeyRange>, rocksdb::Error> {
+    let mut starts: Vec<Vec<u8>> = db
+        .live_files()?
+        .into_iter()
+        .filter(|f| f.column_family_name == cf_name)
+        .filter_map(|f| f.start_key)
+        .map(|mut k| {
+            k.truncate(prefix_len);
+            k
+        })
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    // The smallest start key begins the first range, which is unbounded below.
+    if !starts.is_empty() {
+        starts.remove(0);
+    }
+
+    let wanted = max_ranges.max(1) - 1;
+    let boundaries: Vec<Vec<u8>> = if starts.len() <= wanted {
+        starts
+    } else {
+        (1..=wanted)
+            .map(|i| starts[i * starts.len() / (wanted + 1)].clone())
+            .collect()
+    };
+
+    let mut ranges = Vec::with_capacity(boundaries.len() + 1);
+    let mut lower = None;
+    for b in boundaries {
+        ranges.push(KeyRange {
+            lower,
+            upper: Some(b.clone()),
+        });
+        lower = Some(b);
+    }
+    ranges.push(KeyRange { lower, upper: None });
+    Ok(ranges)
+}
+
+/// Full-scan iterator that decodes each entry straight from the raw
+/// iterator's borrowed key/value slices. The plain RocksDB iterator copies
+/// every key and value into a fresh `Box<[u8]>` first; for the ordering
+/// passes' scans over hundreds of millions of fixed-width entries that
+/// allocate/free pair was the dominant CPU cost.
+struct DecodingIter<'a, K, V> {
+    raw: DBRawIterator<'a>,
+    first: bool,
+    _codec: PhantomData<fn() -> (K, V)>,
+}
+
+impl<K: Key, V: Value> Iterator for DecodingIter<'_, K, V> {
+    type Item = Result<(K, V), OsmFlatcError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !std::mem::take(&mut self.first) {
+            if !self.raw.valid() {
+                return None;
+            }
+            self.raw.next();
+        }
+        match self.raw.item() {
+            Some((k, v)) => Some(Ok((K::from(k), V::from(v)))),
+            None => self.raw.status().err().map(|e| Err(e.into())),
         }
     }
 }
@@ -263,7 +387,7 @@ pub fn create_db(
     // Immutable memtables allowed to queue per column family before writes
     // stall. This is the real ceiling on *concurrent flush jobs* -- at most
     // two column families are actively written during the node/way bulk-load
-    // passes (one in `--flat-nodes` mode), so `flush_threads` below can never
+    // passes, so `flush_threads` below can never
     // be kept busier than roughly `max_write_buffer_number` per active CF.
     // Scale it with cores so bigger machines can sustain more concurrent
     // flushes, but cap it well below `flush_threads`: each unit costs
@@ -310,16 +434,16 @@ pub fn create_db(
 
     let cfs = [
         NodesTDC::NAME,
-        NodeIdToLonLatTDC::NAME,
         NodeIdToIdxTDC::NAME,
         WayTDC::NAME,
         WayIdToMbbTDC::NAME,
         WayIdToIdxTDC::NAME,
-        // Temporary indexes for the way-ordering pass's sort-merge join (see
-        // way.rs) -- same bulk-load lifecycle as everything else above: one
-        // pass writes each fully, the next only reads it.
-        WayRefByNodeTDC::NAME,
-        ResolvedRefTDC::NAME,
+        // Staging and temporary indexes for the way pass's sort-merge join
+        // (see way.rs) -- same bulk-load lifecycle as everything else above:
+        // one pass writes each fully, the next only reads it.
+        WayByIdTDC::NAME,
+        WayNodeRefTDC::NAME,
+        WayNodeResolvedTDC::NAME,
         RELATIONS,
         // Temporary indexes for the relation-member ordering pass's
         // sort-merge join (see relation.rs) -- same bulk-load lifecycle.
@@ -391,7 +515,7 @@ mod create_db_tests {
         let (db, _scratch, _db_opts) =
             create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
 
-        let cf = db.cf_handle(NodeIdToLonLatTDC::NAME).unwrap();
+        let cf = db.cf_handle(NodesTDC::NAME).unwrap();
         let key = 42i64.to_be_bytes();
         db.put_cf(cf, key, [1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
 
@@ -400,5 +524,95 @@ mod create_db_tests {
 
         let got = db.get_cf(cf, key).unwrap();
         assert_eq!(got.as_deref(), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
+    }
+
+    /// The decoding full-scan iterator yields every entry once, in key order,
+    /// and stays exhausted; an empty column family yields nothing.
+    #[test]
+    fn iterator_scans_in_key_order() {
+        use node::storage::NodeIdxLocValue;
+        use storage::OsmIdKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _scratch, _db_opts) =
+            create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
+
+        assert!(<DB as RocksDB>::iterator::<NodeIdToIdxTDC>(&db)
+            .unwrap()
+            .next()
+            .is_none());
+
+        let mut batch = WriteBatchInternal::default();
+        batch.insert_cf(
+            NodeIdToIdxTDC::NAME,
+            db.cf_handle(NodeIdToIdxTDC::NAME).unwrap(),
+        );
+        for id in [30, 10, 20] {
+            batch.put::<NodeIdToIdxTDC>(
+                OsmIdKey::new(id),
+                NodeIdxLocValue::new(id as u64 * 2, 0, 0),
+            );
+        }
+        write_batch_no_wal(&db, batch.inner()).unwrap();
+        finalize_bulk_cfs(&db, &[NodeIdToIdxTDC::NAME]).unwrap();
+
+        let mut iter = <DB as RocksDB>::iterator::<NodeIdToIdxTDC>(&db).unwrap();
+        let got: Vec<(i64, u64)> = iter
+            .by_ref()
+            .map(|r| r.map(|(k, v)| (k.id, v.idx)).unwrap())
+            .collect();
+        assert_eq!(got, vec![(10, 20), (20, 40), (30, 60)]);
+        assert!(iter.next().is_none());
+    }
+
+    /// `key_ranges` splits at SST start keys (truncated to the prefix), and
+    /// scanning its ranges visits every entry exactly once, in order -- with
+    /// all entries sharing a prefix in the same range.
+    #[test]
+    fn key_ranges_tile_the_key_space() {
+        use way::storage::{WayNodeRefKey, WayNodeRefTDC};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _scratch, _db_opts) =
+            create_db(dir.path(), 8 * 1024 * 1024, 4 * 1024 * 1024, 256).unwrap();
+        let cf = db.cf_handle(WayNodeRefTDC::NAME).unwrap();
+
+        // Three flushes of disjoint node-id spans give three SST files. Each
+        // node id is referenced by two ways so prefix grouping is exercised.
+        let mut expected = Vec::new();
+        for span in [0..100i64, 100..200, 200..300] {
+            let mut batch = WriteBatchInternal::default();
+            batch.insert_cf(WayNodeRefTDC::NAME, cf);
+            for node_id in span {
+                for way_id in [7, 9] {
+                    let key = WayNodeRefKey::new(node_id, way_id, 0);
+                    batch.put::<WayNodeRefTDC>(key, storage::EmptyValue);
+                    expected.push(key);
+                }
+            }
+            write_batch_no_wal(&db, batch.inner()).unwrap();
+            db.flush_cf(cf).unwrap();
+        }
+
+        let ranges = key_ranges(&db, WayNodeRefTDC::NAME, 8, 16).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].lower, None);
+        assert_eq!(ranges[0].upper, Some(100i64.to_be_bytes().to_vec()));
+        assert_eq!(ranges[2].upper, None);
+
+        let scanned: Vec<WayNodeRefKey> = ranges
+            .iter()
+            .flat_map(|r| range_iterator::<WayNodeRefTDC>(&db, r).map(|e| e.unwrap().0))
+            .collect();
+        assert_eq!(scanned, expected);
+
+        // Capping the range count still tiles the space.
+        let capped = key_ranges(&db, WayNodeRefTDC::NAME, 8, 2).unwrap();
+        assert_eq!(capped.len(), 2);
+        let total: usize = capped
+            .iter()
+            .map(|r| range_iterator::<WayNodeRefTDC>(&db, r).count())
+            .sum();
+        assert_eq!(total, expected.len());
     }
 }

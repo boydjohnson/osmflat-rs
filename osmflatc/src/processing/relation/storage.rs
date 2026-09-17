@@ -91,7 +91,7 @@ impl RelationInfo {
 
 /// Forward index for the sort-merge join in the relation-member ordering
 /// pass, keyed by referenced node id -- merge-joined against `NodeIdToIdx`
-/// the same way `WayRefByNodeTDC` is joined for way-refs. See relation.rs.
+/// the same way `WayNodeRefTDC` is joined for way-refs. See relation.rs.
 pub struct RelationNodeMemberRefTDC;
 
 impl TempDataCodec for RelationNodeMemberRefTDC {
