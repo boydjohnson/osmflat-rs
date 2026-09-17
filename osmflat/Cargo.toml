@@ -1,6 +1,6 @@
 [package]
 name = "osmflat"
-version = "0.3.1"
+version = "0.300.0"
 authors = [
     "boxdot <d@zerovolt.org>",
     "Christian Vetter <veaac.fdirct@gmail.com>",
